@@ -76,7 +76,7 @@ adb forward tcp:8789 tcp:8789
 curl http://127.0.0.1:8789/health
 ```
 
-> ⚠️ 本机 ROM（Flyme/Android 16）拦截局域网入站，WiFi 直连不可用，adb 转发是唯一稳定通道。
+> ⚠️ 部分 ROM（如 Android 16 定制系统）会拦截局域网入站，WiFi 直连可能不可用；adb 转发是最稳定通道。
 > USB 拔插会丢转发，重跑一次即可（一条 `adb forward tcp:8789 tcp:8789`）。
 
 ### 3. 添加账号

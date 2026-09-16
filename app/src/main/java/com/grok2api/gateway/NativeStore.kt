@@ -546,23 +546,27 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
 
     /** 保存一个模型的健康探测结果（手动触发，持久化以便重启后仍显示）。 */
     fun saveModelHealth(modelId: String, ok: Boolean, latencyMs: Long, error: String): Boolean = synchronized(lock) {
-        writableDatabase.insertWithOnConflict("model_health", null, ContentValues().apply {
-            put("model_id", modelId); put("ok", if (ok) 1 else 0)
-            put("latency_ms", latencyMs); put("error", error)
-            put("checked_at", nowSeconds())
-        }, SQLiteDatabase.CONFLICT_REPLACE) > 0
+        runCatching {
+            writableDatabase.insertWithOnConflict("model_health", null, ContentValues().apply {
+                put("model_id", modelId); put("ok", if (ok) 1 else 0)
+                put("latency_ms", latencyMs); put("error", error)
+                put("checked_at", nowSeconds())
+            }, SQLiteDatabase.CONFLICT_REPLACE) > 0
+        }.getOrDefault(false)
     }
 
-    /** 读取全部模型健康结果（key = model_id）。 */
+    /** 读取全部模型健康结果（key = model_id）。表缺失等异常时返回空 map，绝不让调用方崩。 */
     fun loadModelHealth(): Map<String, JSONObject> = synchronized(lock) {
         val out = LinkedHashMap<String, JSONObject>()
-        readableDatabase.rawQuery("SELECT model_id, ok, latency_ms, error, checked_at FROM model_health", null).use { c ->
-            while (c.moveToNext()) {
-                out[c.getString(0)] = JSONObject().put("done", true).put("ok", c.getInt(1) != 0)
-                    .put("latency_ms", c.getLong(2)).put("error", c.getString(3))
-                    .put("checked_at", c.getDouble(4))
+        runCatching {
+            readableDatabase.rawQuery("SELECT model_id, ok, latency_ms, error, checked_at FROM model_health", null).use { c ->
+                while (c.moveToNext()) {
+                    out[c.getString(0)] = JSONObject().put("done", true).put("ok", c.getInt(1) != 0)
+                        .put("latency_ms", c.getLong(2)).put("error", c.getString(3))
+                        .put("checked_at", c.getDouble(4))
+                }
             }
-        }
+        }.onFailure { android.util.Log.w("NativeStore", "loadModelHealth failed (table missing?)", it) }
         out
     }
 
@@ -769,7 +773,10 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
 
     companion object {
         const val DATABASE_NAME = "grok-native.db"
-        private const val DATABASE_VERSION = 9
+        // v10：新增 model_health 表。注意每次改 schema 必须同步 bump 此版本号——
+        // 否则覆盖安装时 SQLite 不会回调 onCreate/onUpgrade，新表建不出来，
+        // 运行期查询直接抛 no such table（v1.2.1 真实踩坑：刷新模型整个失败）。
+        private const val DATABASE_VERSION = 10
         private const val KEY_ALIAS = "grok_native_app_keys"
         /** 优先级下限：0 = 不额外加权（选号权重 = 1.0）。 */
         const val MIN_PRIORITY = 0

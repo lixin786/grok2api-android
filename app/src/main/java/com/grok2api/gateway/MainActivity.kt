@@ -1631,6 +1631,11 @@ class MainActivity : Activity() {
         val response = NativeCore.refreshAllModels(this)
         val data = response.getJSONArray("models")
         modelCache = data
+        // 目录就绪后恢复上次探测的持久化健康结果——否则重启 App 后健康 chip 会消失，
+        // 用户会误以为没探测过（探测是手动且耗额度的，历史结论必须留住）。
+        modelHealth.clear()
+        modelHealth.putAll(NativeCore.store(this).loadModelHealth()
+            .filterKeys { id -> hasModelOrBase(data, id) })
         val failures = response.getJSONArray("failures")
         if (failures.length() == 0) {
             "已加载 ${data.length()} 个模型"
@@ -1641,6 +1646,15 @@ class MainActivity : Activity() {
             }
             "已加载 ${data.length()} 个模型；$detail"
         }
+    }
+
+    /** 目录里是否存在该模型（含 effort 别名指向基础模型的情形）。 */
+    private fun hasModelOrBase(data: JSONArray, id: String): Boolean {
+        for (i in 0 until data.length()) {
+            val m = data.optJSONObject(i) ?: continue
+            if (m.optString("id") == id || m.optString("base_model") == id) return true
+        }
+        return false
     }
 
     /**
