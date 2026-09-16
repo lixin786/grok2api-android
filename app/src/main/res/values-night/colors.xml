@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="wb_primary">#BEC2FF</color>
+    <color name="wb_primary_container">#34358B</color>
+    <color name="wb_on_primary">#20205F</color>
+    <color name="wb_on_primary_container">#E1E0FF</color>
+    <color name="wb_secondary">#A9C7FF</color>
+    <color name="wb_background">#101016</color>
+    <color name="wb_surface">#19191F</color>
+    <color name="wb_surface_container">#202027</color>
+    <color name="wb_surface_variant">#2B2B34</color>
+    <color name="wb_on_surface">#E5E1EA</color>
+    <color name="wb_on_surface_variant">#C7C4D0</color>
+    <color name="wb_outline">#918F9B</color>
+    <color name="wb_outline_variant">#45454F</color>
+    <color name="wb_success">#72D9A1</color>
+    <color name="wb_success_container">#124F34</color>
+    <color name="wb_warning">#FFBB55</color>
+    <color name="wb_warning_container">#573500</color>
+    <color name="wb_error">#FFB4AB</color>
+    <color name="wb_error_container">#690005</color>
+</resources>

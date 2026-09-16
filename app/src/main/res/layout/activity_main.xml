@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/wb_background"
+    android:orientation="vertical">
+
+    <LinearLayout
+        android:id="@+id/topBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/wb_surface"
+        android:gravity="center_vertical"
+        android:minHeight="64dp"
+        android:orientation="horizontal"
+        android:paddingStart="20dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="8dp">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/pageTitle"
+                style="@style/WbText.Title"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="概览" />
+
+            <TextView
+                android:id="@+id/pageSubtitle"
+                style="@style/WbText.Caption"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="1dp"
+                android:text="本地模型网关" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/headerStatus"
+            style="@style/WbStatusChip"
+            android:layout_width="wrap_content"
+            android:layout_height="32dp"
+            android:gravity="center"
+            android:minWidth="76dp"
+            android:text="○ 已停止"
+            android:textColor="@color/wb_on_surface_variant" />
+    </LinearLayout>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="@color/wb_outline_variant" />
+
+    <FrameLayout
+        android:id="@+id/contentHost"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
+
+    <LinearLayout
+        android:id="@+id/bottomNavigation"
+        android:layout_width="match_parent"
+        android:layout_height="80dp"
+        android:background="@color/wb_surface_container"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:paddingStart="4dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="4dp"
+        android:paddingBottom="6dp">
+
+        <TextView
+            android:id="@+id/navOverview"
+            style="@style/WbBottomNavItem"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:drawableTop="@drawable/ic_dashboard"
+            android:text="概览" />
+
+        <TextView
+            android:id="@+id/navAccounts"
+            style="@style/WbBottomNavItem"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:drawableTop="@drawable/ic_account"
+            android:text="账号" />
+
+        <TextView
+            android:id="@+id/navModels"
+            style="@style/WbBottomNavItem"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:drawableTop="@drawable/ic_models"
+            android:text="模型" />
+
+        <TextView
+            android:id="@+id/navRecords"
+            style="@style/WbBottomNavItem"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:drawableTop="@drawable/ic_history"
+            android:text="记录" />
+
+        <TextView
+            android:id="@+id/navMore"
+            style="@style/WbBottomNavItem"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:drawableTop="@drawable/ic_more"
+            android:text="更多" />
+    </LinearLayout>
+</LinearLayout>

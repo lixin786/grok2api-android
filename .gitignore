@@ -1,0 +1,56 @@
+# ── 构建产物 ──────────────────────────────────────────
+build/
+app/build/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+local.properties
+
+# ── IDE ─────────────────────────────────────────────
+.idea/
+*.iml
+.vscode/
+*.swp
+*~
+
+# ── 敏感数据（绝不提交）──────────────────────────────
+# 数据库：含账号凭证、应用 Key、使用记录
+*.db
+*.db-wal
+*.db-shm
+# 账号 auth 文件
+auths/
+data/
+# 加密主密钥
+.secret_key
+# 环境变量
+.env
+.env.local
+# 签名密钥
+*.jks
+*.keystore
+keystore.properties
+
+# ── Python 后端（本仓库仅含 Android 源码）─────────────
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ── 前端依赖 ────────────────────────────────────────
+node_modules/
+frontend/dist/
+.pnpm-store/
+
+# ── 工具临时目录 ────────────────────────────────────
+.taixu-tmp/
+.taixu-subagent/
+
+# ── 系统 ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
