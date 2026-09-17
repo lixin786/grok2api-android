@@ -17,7 +17,16 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      # 不用 android-actions/setup-android：它在新镜像上会因为找不到 'tools' 包直接挂，
+      # 而 runner 本身预装了 SDK + cmdline-tools，只差我们在 compileSdk 用到的 platform/build-tools。
+      - name: 准备 Android SDK 组件
+        run: |
+          set -e
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMGR=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          echo "sdk=$SDK sdkmanager=$SDKMGR"
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          "$SDKMGR" "platforms;android-36" "build-tools;36.0.0" > /dev/null
       - name: 单元测试（风控纯逻辑）
         run: ./gradlew testDebugUnitTest --no-daemon
       - name: 上传测试报告
@@ -35,6 +44,13 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      - name: 准备 Android SDK 组件
+        run: |
+          set -e
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMGR=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          echo "sdk=$SDK sdkmanager=$SDKMGR"
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          "$SDKMGR" "platforms;android-36" "build-tools;36.0.0" > /dev/null
       - name: 编译 release（确保混淆规则不炸）
         run: ./gradlew assembleRelease --no-daemon
