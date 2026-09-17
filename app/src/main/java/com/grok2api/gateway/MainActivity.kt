@@ -269,6 +269,47 @@ class MainActivity : Activity() {
         }
     }
 
+
+    /**
+     * 号池健康 + 号池维护区块。
+     *
+     * 抽成独立函数而不是写死在某一页里：这两块是"日常最常看的运营信息"，
+     * 之前挂在账号页、和账号列表挤在一起；现在放概览页快速概览正下方，
+     * 打开 App 第一眼就能看到池子是否健康、要不要补号。
+     */
+    private fun LinearLayout.poolMaintenanceSections() {
+        val summary = NativeCore.poolSummary(this@MainActivity)
+        addView(section("号池健康"))
+        addView(card {
+            addView(row {
+                addView(text("可用率", 14, true, R.color.wb_on_surface_variant), weighted())
+                // 注意口径：poolSummary 给的是 0~1 的比值，而 formatPercent 按 0~100 百分数设计
+                // （踩过：直接传比值会显示成 "0.9%"）
+                addView(text("${formatPercent(summary.optDouble("usable_ratio", 0.0) * 100)}（${summary.optInt("usable")}/${summary.optInt("total")}）",
+                    16, true), weighted())
+            })
+            addView(caption("可用 = 已启用且不在冷却期的账号占比；低于 70% 建议先体检再补号。"), top(4))
+            addView(row(top = 10) {
+                addView(chip("健康 ${summary.optInt("healthy")}", R.color.wb_success_container, R.color.wb_success), weighted())
+                addView(chip("警告 ${summary.optInt("warning")}", R.color.wb_surface_variant, R.color.wb_on_surface_variant), weighted(start = 6))
+                addView(chip("异常 ${summary.optInt("dead")}", R.color.wb_error_container, R.color.wb_error), weighted(start = 6))
+            })
+            addView(row(top = 6) {
+                addView(caption("未体检 ${summary.optInt("unchecked")} · 停用 ${summary.optInt("disabled")} · 冷却中 ${summary.optInt("cooling")}"), weighted())
+            })
+            addView(caption("额度耗尽 ${summary.optInt("quota_exhausted")} · 带 bot 标记 ${summary.optInt("bot_flagged")}"), top(4))
+            addView(labelValue("剩余额度", "${formatTokensExact(summary.optLong("tokens_remaining"))} tokens"), top(8))
+        })
+        addView(section("号池维护"))
+        addView(card {
+            addView(action("检查账号健康", full = true) { healthCheck() })
+            addView(action("降智探测（真实对话）", outlined = true, full = true) { qualityProbe() }, top(8))
+            addView(action("刷新全部账号额度", outlined = true, full = true) { refreshCredits() }, top(8))
+            addView(action("重新探测各账号用量", outlined = true, full = true) { checkIn() }, top(8))
+            addView(caption("体检 = 本地信号 + 上游探测（分级冷却，不误杀）；降智探测 = 发一次真实短对话看有无推理输出，判断是否被上游降智。"), top(10))
+        })
+    }
+
     private fun overviewPage(): View = page {
         val accounts = NativeCore.listAccounts(this@MainActivity)
         val account = NativeCore.loadAccount(this@MainActivity)
@@ -304,30 +345,9 @@ class MainActivity : Activity() {
                 if (quotas.length() > 0) "共 ${quotas.length()} 个账号" else "待配置"), weighted())
             addView(metric("运行记录", events.size.toString(), "本次会话"), weighted(start = 10))
         })
-        if (accounts.length() > 0) {
-            val quotaByUid = HashMap<String, JSONObject>()
-            for (i in 0 until quotas.length()) {
-                val q = quotas.getJSONObject(i)
-                quotaByUid[q.optString("uid")] = q
-            }
-            addView(section("账号额度"))
-            for (i in 0 until accounts.length()) {
-                val item = accounts.getJSONObject(i)
-                val q = quotaByUid[item.optString("uid")]
-                addView(card(topMargin = if (i == 0) 0 else 8) {
-                    addView(row {
-                        addView(text(accountDisplayName(item), 16, true), weighted())
-                        addView(chip(if (item.optBoolean("enabled", true)) "已启用" else "已停用",
-                            if (item.optBoolean("enabled", true)) R.color.wb_success_container else R.color.wb_surface_variant,
-                            if (item.optBoolean("enabled", true)) R.color.wb_success else R.color.wb_on_surface_variant))
-                    })
-                    addView(caption("UID ${shortUid(item.optString("uid"))}"), top(4))
-                    addView(text(if (q != null) "剩余 ${formatTokensExact(q.optLong("remaining"))} / ${formatTokensExact(q.optLong("limit"))} tokens"
-                        else "额度尚未统计",
-                        15, true, R.color.wb_primary), top(7))
-                })
-            }
-        }
+        // 号池健康与维护：放在快速概览正下方（原来的「账号额度」逐号列表已移除——
+        // 每号额度在「账号」页与「用量」页都有，概览页重复列一遍只会把关键信息挤下去）。
+        poolMaintenanceSections()
         addView(section("开始使用"))
         addView(card {
             addView(text(if (account == null) "连接 Grok 账号" else "${account.nickname} 已就绪", 17, true))
@@ -357,7 +377,8 @@ class MainActivity : Activity() {
         addView(action("切换账号登录", outlined = true, full = true) {
             startOAuthSwitch()
         }, top(8))
-        addView(action("导入 auth 文件", outlined = true, full = true) { chooseAuth() }, top(8))
+        addView(action("一键导入（多格式）", outlined = true, full = true) { chooseImport() }, top(8))
+        addView(caption("支持：本应用出 JSON / 扁平 JSON（单账号或数组）/ grok2api 批量文档 / 每行一个 refresh_token 的纯文本"), top(4))
         addView(action("导出全部账号", outlined = true, full = true) { exportAllAccounts() }, top(8))
         if (accounts.length() == 0) {
             addView(stateCard("尚未连接账号", "点上方按钮走 xAI 设备授权：App 内置窗口打开 xAI 授权页，确认后自动完成，不需要手动复制任何东西。也可以直接导入已有的凭据 JSON（支持 access_token / refresh_token 扁平格式）。已登录的账号可用上方「导出全部账号」备份，换机时再导入即可。", "空"), top(14))
@@ -370,14 +391,46 @@ class MainActivity : Activity() {
                 addView(card(topMargin = if (i == 0) 0 else 10) {
                     addView(row {
                         addView(text(account.optString("nickname", "Grok 用户"), 18, true), weighted())
-                        addView(chip(if (account.optBoolean("healthy")) "● 健康" else if (account.optBoolean("enabled", true)) "冷却" else "已停用",
-                            if (account.optBoolean("healthy")) R.color.wb_success_container else R.color.wb_surface_variant,
-                            if (account.optBoolean("healthy")) R.color.wb_success else R.color.wb_on_surface_variant))
+                        // 徽章口径（面板科学化的核心）：优先显示体检结论，没体检过就显示实时可用性。
+                        val riskLevel = account.optString("risk_level")
+                        val badge = when {
+                            !account.optBoolean("enabled", true) -> "已停用" to R.color.wb_surface_variant
+                            riskLevel == "dead" -> "● 异常" to R.color.wb_error_container
+                            riskLevel == "warning" -> "● 警告" to R.color.wb_surface_variant
+                            riskLevel == "healthy" -> "● 健康" to R.color.wb_success_container
+                            account.optBoolean("healthy") -> "● 可用（未体检）" to R.color.wb_success_container
+                            else -> "● 冷却中" to R.color.wb_surface_variant
+                        }
+                        addView(chip(badge.first, badge.second,
+                            if (riskLevel == "dead") R.color.wb_error
+                            else if (riskLevel == "warning") R.color.wb_on_surface_variant
+                            else R.color.wb_success))
                     })
                     // 上游风控标记：access_token 的 JWT 带 bot_flag_source/bfs=1|2 即被打了 bot 标记，
                     // 该号仍可用但随时可能被拒，轮询已自动把它排到最后——必须让用户看见这个状态。
+                    val riskReason = account.optString("risk_reason")
+                    if (riskReason.isNotBlank()) {
+                        addView(caption("体检结论：$riskReason"), top(6))
+                    }
+                    val failCode = account.optString("last_failure_code")
+                    val cdReason = account.optString("cooldown_reason")
+                    if (failCode.isNotBlank() || cdReason.isNotBlank()) {
+                        val kindLabel = when (cdReason) {
+                            "quota" -> "额度类"; "rate" -> "限流类"; "auth" -> "凭据类"
+                            "blocked" -> "封锁类"; "server" -> "服务端"; "transport" -> "传输类"
+                            else -> "未分类"
+                        }
+                        val cdLeft = account.optDouble("cooldown_remaining_sec", 0.0)
+                        addView(caption("失败码 $failCode（$kindLabel）" +
+                            if (cdLeft > 0) " · 冷却剩余 ${cdLeft.toLong()}s" else ""), top(4))
+                        val probeAt = account.optDouble("next_probe_at", 0.0)
+                        if (probeAt > System.currentTimeMillis() / 1000.0) {
+                            addView(caption("将在 ${formatClock(probeAt)} 自动做恢复探测"), top(4))
+                        }
+                    }
+                    // bot_flag 只作为提示与降级依据，不再等同于"坏号"（grok.com 该字段已被证明不可靠）
                     if (account.optInt("bot_risk") != 0) {
-                        addView(caption("⚠ 上游已标记此账号为 bot 风险（已自动排到轮询末位）"), top(6))
+                        addView(caption("⚠ 带上游 bot 标记（已降级使用，不必然失效）"), top(6))
                     }
                     addView(labelValue("版本", account.optString("region_label", "xAI")), top(10))
                     addView(labelValue("UID", uid), top(6))
@@ -416,12 +469,6 @@ class MainActivity : Activity() {
                 })
             }
         }
-        addView(section("账号操作"))
-        addView(card {
-            addView(action("刷新全部账号额度", full = true) { refreshCredits() })
-            addView(action("重新探测各账号用量", outlined = true, full = true) { checkIn() }, top(8))
-            addView(caption("本地用量实时统计；「刷新/探测」用于向 xAI 查询该账号是否已被限额。"), top(10))
-        })
         // 汇总卡片与「用量」页用同一套 token 实时刻度口径。
         val quotaRows = NativeCore.quotaOverview(this@MainActivity)
         if (quotaRows.length() > 0) {
@@ -1515,6 +1562,15 @@ class MainActivity : Activity() {
         }, REQ_AUTH)
     }
 
+    /** 一键导入：放宽选择器（json/文本都能选），交给多格式解析器识别。 */
+    private fun chooseImport() {
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/json", "text/plain", "application/octet-stream"))
+        }, REQ_IMPORT)
+    }
+
     /**
      * 导出单个账号的 auth 文件。
      * 走系统 SAF 让用户自选保存位置（下载目录/网盘/文件管理器都行），文件名带昵称与 UID 便于区分。
@@ -1572,6 +1628,7 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_AUTH && resultCode == RESULT_OK) data?.data?.let { importAuth(it) }
+        if (requestCode == REQ_IMPORT && resultCode == RESULT_OK) data?.data?.let { importAuth(it) }
         if (requestCode == REQ_EXPORT && resultCode == RESULT_OK) data?.data?.let { writeExport(it) }
     }
 
@@ -1582,19 +1639,28 @@ class MainActivity : Activity() {
             require(bytes.size <= max) { "认证文件不能超过 1 MB" }
             bytes.toString(Charsets.UTF_8)
         } ?: error("无法读取所选文件")
-        runCatching { JSONObject(raw) }.fold(
-            onSuccess = { parsed ->
-                val account = NativeCore.saveAccount(this, parsed)
-                "账号 ${account.nickname} (${account.uid}) 已导入"
-            },
-            onFailure = {
-                val result = NativeCore.importAccounts(this, JSONArray(raw))
-                val imported = result.getJSONArray("imported")
-                val rejected = result.getJSONArray("rejected")
-                require(imported.length() > 0) { rejected.optJSONObject(0)?.optString("error", "认证文件为空") ?: "认证文件为空" }
-                "已导入 ${imported.length()} 个账号${if (rejected.length() > 0) "，${rejected.length()} 个失败" else ""}"
-            }
-        )
+        val result = NativeCore.parseImportText(raw)
+        val accepted = result.first
+        val rejected = result.second
+        if (accepted.length() == 0) {
+            val detail = if (rejected.length() > 0) rejected.optJSONObject(0)?.optString("error") else null
+            throw IllegalStateException(detail ?: "文件中没有可识别的账号")
+        }
+        val imported = JSONArray()
+        val failures = JSONArray()
+        for (i in 0 until accepted.length()) {
+            runCatching { NativeCore.saveAccount(this, accepted.getJSONObject(i)) }
+                .onSuccess { imported.put(it.uid) }
+                .onFailure { failures.put(JSONObject().put("index", i).put("error", it.message ?: "入库失败")) }
+        }
+        require(imported.length() > 0) {
+            failures.optJSONObject(0)?.optString("error") ?: "全部账号入库失败"
+        }
+        buildString {
+            append("已导入 ${imported.length()}")
+            if (failures.length() > 0) append("，失败 ${failures.length()}（${failures.optJSONObject(0)?.optString("error")}）")
+            if (rejected.length() > 0) append("；另有 ${rejected.length()} 条无法解析")
+        }
     }
 
     /**
@@ -1611,7 +1677,98 @@ class MainActivity : Activity() {
             val q = quotas.getJSONObject(i)
             if (q.optBoolean("enabled", true)) { used += q.optLong("used"); limit += q.optLong("limit") }
         }
+        // 有账号刷新失败 ≈ 可能出风控/凭据问题了，顺手体检并提示清理
+        if (failed > 0) main.post { healthCheck(deep = false) }
         "已刷新 ${results.length() - failed}/${results.length()} 个账号，剩余额度 ${formatTokensExact((limit - used).coerceAtLeast(0))} tokens${if (failed > 0) "，$failed 个失败" else ""}"
+    }
+
+    /**
+     * 账号健康检查：本地信号 + 上游探测，结果异常时弹窗询问是否清理。
+     *
+     * 上游探测逐个账号打一次上游，账号多时会慢一些，所以走 runTask 的后台线程 + loading 提示。
+     */
+    private fun healthCheck(deep: Boolean = true, silentIfClean: Boolean = false) {
+        showLoading("检查账号健康…")
+        io.execute {
+            val report = runCatching { NativeCore.accountHealth(this, deep) }
+            main.post {
+                report.fold({ r ->
+                    val dead = r.optInt("dead"); val warning = r.optInt("warning")
+                    val healthy = r.optInt("healthy"); val checked = r.optInt("checked")
+                    record("账号健康检查：共 $checked 个，正常 $healthy、警告 $warning、异常 $dead")
+                    render(Page.ACCOUNTS)
+                    if (checked == 0) { toast("号池里还没有账号"); return@fold }
+                    if (dead == 0) {
+                        if (!silentIfClean) {
+                            toast("健康检查完成：$checked 个账号全部正常" +
+                                if (warning > 0) "（$warning 个有警告）" else "")
+                        }
+                        return@fold
+                    }
+                    promptUnhealthy(r)
+                }, { err ->
+                    toast("健康检查失败：${err.message ?: "未知错误"}")
+                })
+            }
+        }
+    }
+
+    /** 降智探测：对号池跑一轮真实短对话，判定有没有被上游降智。 */
+    private fun qualityProbe() = runTask("降智探测", Page.ACCOUNTS) {
+        val report = NativeCore.qualityProbeAll(this, limit = 5)
+        val results = report.optJSONArray("results") ?: JSONArray()
+        var healthy = 0; var risk = 0; var error = 0
+        for (i in 0 until results.length()) {
+            when (results.optJSONObject(i)?.optString("verdict")) {
+                "healthy" -> healthy++; "risk" -> risk++; else -> error++
+            }
+        }
+        record("降智探测：健康 $healthy，疑似降智 $risk，失败 $error")
+        "降智探测完成：健康 $healthy，疑似降智 $risk，失败 $error（结果已写入各账号）"
+    }
+
+    /** 异常号清理提示：默认「停用」（可逆），另给「删除」与「查看明细」。 */
+    private fun promptUnhealthy(report: JSONObject) {
+        val results = report.optJSONArray("results") ?: JSONArray()
+        val deadKeys = mutableListOf<String>()
+        val lines = StringBuilder()
+        var shown = 0
+        for (i in 0 until results.length()) {
+            val item = results.optJSONObject(i) ?: continue
+            if (item.optString("severity") != "dead") continue
+            deadKeys.add(item.optString("account_key"))
+            if (shown < 5) {
+                val reasons = item.optJSONArray("reasons")
+                val why = (0 until (reasons?.length() ?: 0))
+                    .joinToString("；") { reasons!!.optString(it) }
+                lines.append("• ${item.optString("email").ifBlank { item.optString("uid").take(8) }}：$why\n")
+                shown++
+            }
+        }
+        if (deadKeys.size > shown) lines.append("…等共 ${deadKeys.size} 个异常号\n")
+        AlertDialog.Builder(this)
+            .setTitle("发现 ${deadKeys.size} 个异常账号")
+            .setMessage("这些号会影响号池成功率，建议清理：\n\n$lines\n" +
+                "「停用」可逆（保留凭据，之后能再启用）；「删除」不可恢复。")
+            .setNegativeButton("稍后处理", null)
+            .setNeutralButton("仅停用") { _, _ ->
+                runTask("停用异常账号", Page.ACCOUNTS) {
+                    val n = NativeCore.setAccountsEnabled(this, deadKeys, false)
+                    "已停用 $n 个异常账号"
+                }
+            }
+            .setPositiveButton("删除") { _, _ ->
+                AlertDialog.Builder(this)
+                    .setTitle("确认删除 ${deadKeys.size} 个账号？")
+                    .setMessage("凭据将从号池移除，且无法恢复。若只是暂时不可用，建议改用「停用」。")
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("删除") { _, _ ->
+                        runTask("删除异常账号", Page.ACCOUNTS) {
+                            val removed = NativeCore.deleteAccounts(this, deadKeys)
+                            "已删除 ${removed.length()} 个异常账号"
+                        }
+                    }.show()
+            }.show()
     }
 
     /** xAI 无签到，等价操作是把所有账号的额度刷新一遍。 */
@@ -1624,6 +1781,8 @@ class MainActivity : Activity() {
             val item = results.getJSONObject(it); !item.optBoolean("ok") && !item.optBoolean("skipped")
         }
         val skipped = results.length() - success - failed
+        // 探测到失败就顺手做一次健康体检并提示，避免坏号静默留在池里
+        if (failed > 0) main.post { healthCheck(deep = false) }
         "额度刷新完成：成功 $success，失败 $failed${if (skipped > 0) "，跳过 $skipped" else ""}；详情见账号页"
     }
 
@@ -2148,6 +2307,7 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_AUTH = 1001
+        private const val REQ_IMPORT = 1003
         /** 导出账号到用户选定位置（SAF 创建文档）。 */
         private const val REQ_EXPORT = 1002
         /** 优先级可调范围：0 = 不额外加权（权重 1.0）；20 已是权重 ×21，足够拉开账号间差距又不至于让滑块粒度失控。 */

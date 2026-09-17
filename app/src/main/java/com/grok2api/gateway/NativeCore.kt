@@ -154,7 +154,12 @@ object NativeCore {
     fun saveAccount(context: Context, root: JSONObject, requestedRegion: AccountRegion? = null): Account {
         root.put("region", AccountRegion.XAI.id)
         val account = Account(root)
-        require(account.auth.optString("accessToken").isNotBlank()) { "auth 文件缺少 accessToken" }
+        // 官方 grok2api 允许「只给 refresh_token」的导入（首次使用时换票）。
+        // 因此这里只要求二者至少有一个，不再强制 accessToken。
+        require(
+            account.auth.optString("accessToken").isNotBlank() ||
+                account.auth.optString("refreshToken").isNotBlank()
+        ) { "auth 文件缺少 accessToken（至少需要 accessToken 或 refreshToken）" }
         require(account.uid.isNotBlank()) { "auth 文件缺少 account.uid（或 user_id）" }
         store(context).upsertAccount(root, AccountRegion.XAI.id)
         context.getSharedPreferences("native", Context.MODE_PRIVATE).edit().remove("account").apply()
@@ -212,22 +217,121 @@ object NativeCore {
             raw.optString("client_id"), raw.optString("clientId"), XaiProtocol.OAUTH_CLIENT_ID
         ))
         token.put("domain", firstNonBlank(raw.optString("domain"), AccountRegion.XAI.defaultDomain))
+        // 过期时间三来源（对齐 Go 版）：显式 expires_in → RFC3339 expires_at → JWT exp claim
         val expires = raw.optLong("expires_in", 0L)
-        if (expires > 0) token.put("expiresAt", System.currentTimeMillis() + expires * 1000L)
+        if (expires > 0) {
+            token.put("expiresAt", System.currentTimeMillis() + expires * 1000L)
+        } else {
+            raw.optString("expires_at").takeIf { it.isNotBlank() }?.let { txt ->
+                runCatching { java.time.Instant.parse(txt).toEpochMilli() }.getOrNull()
+                    ?.let { token.put("expiresAt", it) }
+            }
+            if (token.optLong("expiresAt", 0L) == 0L) {
+                jwtClaims(access)?.optLong("exp", 0L)?.takeIf { it > 0 }
+                    ?.let { token.put("expiresAt", it * 1000L) }
+            }
+        }
         val idToken = firstNonBlank(raw.optString("id_token"), raw.optString("idToken"))
         if (idToken.isNotBlank()) token.put("idToken", idToken)
         val userId = firstNonBlank(
             raw.optString("user_id"), raw.optString("userId"), raw.optString("sub"),
-            subjectFromJwt(access), subjectFromJwt(idToken)
+            raw.optString("principal_id"), subjectFromJwt(access), subjectFromJwt(idToken)
         )
-        val email = firstNonBlank(raw.optString("email"), emailFromJwt(idToken), emailFromJwt(access))
+        val email = firstNonBlank(
+            raw.optString("email"), emailFromJwt(idToken), emailFromJwt(access)
+        )
+        // 只有 refresh_token 的导入：accessToken 为空，必须让首次调用先换票。
+        // 选号逻辑只在「已知过期时间且已到期」时才刷新，所以这里显式写一个过去的时间戳
+        // （1 会被 normalizedExpiryMillis 当作秒 → 1970 年），否则会拿空 token 去打上游得 401。
+        if (access.isBlank() && refresh.isNotBlank()) token.put("expiresAt", 1L)
+        // 纯文本路径只有 refresh_token：uid 缺失时用它派生稳定标识（哈希），保证可入库可轮换
+        val effectiveUid = if (userId.isBlank() && refresh.isNotBlank()) "rt-" + sha256Short(refresh) else userId
         return JSONObject()
             .put("region", AccountRegion.XAI.id)
             .put("auth", token)
-            .put("account", JSONObject().put("uid", userId)
-                .put("user_id", userId)
+            .put("account", JSONObject().put("uid", effectiveUid)
+                .put("user_id", effectiveUid)
                 .put("email", email)
-                .put("nickname", displayName(email, userId)))
+                .put("nickname", displayName(email, effectiveUid)))
+    }
+
+    /** 短哈希（12 位 hex）：给只有 refresh_token 的导入生成稳定 uid。 */
+    private fun sha256Short(value: String): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(value.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+            .take(12)
+
+    /**
+     * 一键导入：把任意常见格式的凭据文本解析成账号数组。
+     *
+     * 兼容格式（与官方 grok2api Go 版对齐）：
+     *  1. 本 App 导出的 JSON（单个对象或数组，含 auth/account 包装）；
+     *  2. 扁平 JSON（单个对象或数组；键名兼容 snake_case 与 camelCase，
+     *     含 provider/name/client_id/access_token/refresh_token/id_token/token_type/
+     *     scope/expires_at(RFC3339)/expires_in/email/sub/user_id/principal_id/team_id）；
+     *  3. Go 版批量文档 `{"accounts":[ {...}, ... ]}`；
+     *  4. 纯文本：每行一个 refresh_token（`rt=` / `refresh_token=` 前缀可有可无）。
+     *
+     * 解析原则：从最严格到最宽松逐个尝试；每个账号独立解析、独立报错，
+     * 部分失败不影响其余账号导入。
+     */
+    fun parseImportText(text: String): Pair<JSONArray, JSONArray> {
+        val accepted = JSONArray(); val rejected = JSONArray()
+        fun reject(index: Int, error: String) {
+            rejected.put(JSONObject().put("index", index).put("error", error))
+        }
+        val trimmed = text.replace("\uFEFF", "").trim()
+
+        val entries = mutableListOf<JSONObject>()
+        // ---- 形态判定与解析（JSON → 纯文本逐级放宽）----
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            val parsed = runCatching { normalizeJsonEntries(trimmed) }
+                .getOrElse { e ->
+                    rejected.put(JSONObject().put("index", 0).put("error", "JSON 解析失败：${e.message}"))
+                    null
+                }
+            if (parsed != null) entries.addAll(parsed)
+        } else {
+            // 非 JSON：按纯文本 refresh_token 行解析
+            var lineNo = 0
+            for (line in trimmed.lines()) {
+                lineNo++
+                val token = line.trim()
+                    .removePrefix("rt=").removePrefix("refresh_token=")
+                    .trim()
+                if (token.isEmpty()) continue
+                if (token.length < 20 || !Regex("[A-Za-z0-9_-]+").matches(token)) {
+                    reject(lineNo - 1, "第 $lineNo 行不是有效的 refresh_token")
+                    continue
+                }
+                entries.add(JSONObject().put("refresh_token", token))
+            }
+            if (entries.isEmpty() && rejected.length() == 0) {
+                reject(0, "无法识别的文件内容：既不是 JSON 也不是每行一个 refresh_token")
+            }
+        }
+
+        // ---- 逐账号归一化导入 ----
+        for ((index, entry) in entries.withIndex()) {
+            runCatching { normalizeImportedAccount(entry) }
+                .onSuccess { accepted.put(it) }
+                .onFailure { reject(index, it.message ?: "解析失败") }
+        }
+        return accepted to rejected
+    }
+
+    /** 把 JSON 文本拆成"账号条目"数组：支持单对象、数组、`{"accounts":[...]}` 文档三种。 */
+    private fun normalizeJsonEntries(text: String): List<JSONObject> {
+        val root = runCatching { JSONObject(text) }.getOrElse {
+            val arr = JSONArray(text)
+            return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+        }
+        // Go 版批量文档：{"accounts":[...]}
+        root.optJSONArray("accounts")?.let { arr ->
+            return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+        }
+        return listOf(root)
     }
 
     /**
@@ -802,6 +906,497 @@ object NativeCore {
 
     private fun emailFromJwt(token: String): String = jwtClaims(token)?.optString("email").orEmpty()
 
+    // ------------------------------------------------------------- 号池风控 / 农场
+
+    /**
+     * 读 access_token 里的 xAI 风控标记。
+     *
+     * xAI 把 `bot_flag_source`（部分版本叫 `bfs`）写进 JWT claim，**数值 1 = 该账号已被风控标记**。
+     * 被标记的号接口仍可能返回 200，但媒体生成等能力会被降级为随机内容，且更容易中途失效，
+     * 因此入池与体检都要把它当坏号。社区实证：请求量过大时连付费号也会被标记
+     * （Wei-Shaw/sub2api#4578）；chenyme/grok2api 亦专门解析该字段做路由降级。
+     */
+    internal fun botFlagSource(token: String): Int = RiskLogic.botFlagSource(token)
+
+    /**
+     * 上游失败分类（参照 chenyme/grok2api 的 failure.go：把 401/402/403/429/5xx 与
+     * "内容安全拒绝""请求级策略拒绝"彻底分开，避免把安全拒绝误判成账号被封）。
+     *
+     * kind 决定处置：
+     *  - `auth`     凭据失效/被拒        → 该号出池待重授权
+     *  - `blocked`  账号被上游封锁        → 出池
+     *  - `quota`    额度耗尽/付费要求     → 长冷却 + 排恢复探测（不弃号）
+     *  - `policy`   内容/请求级策略拒绝   → **软失败**：不冷却、不换号语义、不降健康（只是这次请求不合规）
+     *  - `rate`     限流                  → 长冷却（风控类）
+     *  - `server`   5xx                   → 短冷却（基础设施抖动）
+     *  - `transport`超时/连接失败/空响应   → 短冷却
+     *  - `unknown`  其余                  → 短冷却，只计一次软失败
+     */
+    /** 上游失败分类：纯逻辑在 [RiskLogic]，这里只转发（便于 JVM 单测覆盖）。 */
+    fun classifyUpstreamFailure(status: Int, body: String): RiskLogic.UpstreamFailure =
+        RiskLogic.classifyUpstreamFailure(status, body)
+
+    /** 分类结果 → 冷却秒数（短冷却=基础设施抖动，长冷却=风控类）。 */
+    private fun cooldownSecondsFor(kind: String, settings: JSONObject): Long =
+        RiskLogic.cooldownSecondsFor(
+            kind,
+            settings.optString("cooldown_network_sec", "90").toLongOrNull() ?: 90L,
+            settings.optString("cooldown_risk_sec", "1800").toLongOrNull() ?: 1800L,
+        )
+
+    /**
+     * 按分类结果落库：写冷却（分级）、失败码，并把结论回写 risk_level。
+     * kind=policy 直接返回（软失败不改状态）。
+     */
+    fun applyUpstreamFailure(context: Context, accountKey: String, status: Int, body: String): RiskLogic.UpstreamFailure {
+        val f = classifyUpstreamFailure(status, body)
+        if (f.kind == "policy") return f
+        val settings = store(context).getSettings()
+        val secs = cooldownSecondsFor(f.kind, settings)
+        val level = when (f.kind) {
+            "blocked", "auth" -> "dead"
+            "quota", "rate" -> "warning"
+            else -> "warning"
+        }
+        val reason = when (f.kind) {
+            "blocked" -> "上游封锁账号（$f.code）"
+            "auth" -> "凭据被拒（$f.code），需重新授权"
+            "quota" -> "额度耗尽（$f.code），等待恢复探测"
+            "rate" -> "上游限流（$f.code）"
+            "server" -> "上游 5xx（$f.code）"
+            "transport" -> "传输异常（$f.code）"
+            else -> "未知失败（$f.code）"
+        }
+        store(context).setAccountRisk(accountKey, level, reason, f.code,
+            cooldownReason = f.kind,
+            nextProbeAt = if (f.kind == "quota") System.currentTimeMillis() / 1000.0 + secs else 0.0)
+        if (secs > 0) {
+            store(context).setAccountCooldown(accountKey, System.currentTimeMillis() / 1000.0 + secs, f.kind, f.code)
+        }
+        return f
+    }
+
+    /**
+     * 额度恢复探测：把"冷却已到期且是额度/限流类"的号重新打一次上游，
+     * 成功即清冷却回池（参照 chenyme 的 quota recovery：不靠时间估算硬冻，靠真实探测恢复）。
+     */
+    fun probeRecoverableAccounts(context: Context, limit: Int = 5): JSONObject {
+        val now = System.currentTimeMillis() / 1000.0
+        val recovered = JSONArray(); val stillOut = JSONArray()
+        var probed = 0
+        val accounts = listAccounts(context)
+        for (i in 0 until accounts.length()) {
+            if (probed >= limit) break
+            val meta = accounts.optJSONObject(i) ?: continue
+            val key = meta.optString("account_key")
+            val reason = meta.optString("cooldown_reason")
+            if (reason != "quota" && reason != "rate") continue
+            val until = meta.optDouble("cooldown_until", 0.0)
+            val nextProbe = meta.optDouble("next_probe_at", 0.0)
+            if (until > now) continue                       // 还没到点
+            if (nextProbe > 0 && nextProbe > now) continue  // 还没到探测时间
+            probed++
+            runCatching { refreshCredits(context, key) }.fold(
+                onSuccess = {
+                    store(context).setAccountCooldown(key, 0.0, "", "")
+                    store(context).setAccountRisk(key, "healthy", "额度已恢复（探测通过）")
+                    recovered.put(key)
+                },
+                onFailure = { err ->
+                    val f = classifyUpstreamFailure(0, err.message ?: "")
+                    val settings = store(context).getSettings()
+                    val backoff = (cooldownSecondsFor(f.kind, settings) / 4).coerceAtLeast(60L)
+                    store(context).setAccountRisk(key, "warning", "恢复探测失败：${f.code}",
+                        f.code, "quota", now + backoff)
+                    stillOut.put(JSONObject().put("account_key", key).put("error", f.code))
+                }
+            )
+        }
+        return JSONObject().put("ok", true).put("probed", probed)
+            .put("recovered", recovered).put("still_out", stillOut)
+    }
+
+    /** access_token 是否是可解析的 JWT。解析不了说明凭据已损坏，调度时也拿不到 uid/标记。 */
+    internal fun jwtParsable(token: String): Boolean = RiskLogic.jwtParsable(token)
+
+    /** 单账号风控体检（只报告，不改状态）。 */
+    private fun accountRiskOf(root: JSONObject, enabled: Boolean, meta: JSONObject): JSONObject {
+        val auth = root.optJSONObject("auth") ?: root
+        val profile = root.optJSONObject("account") ?: JSONObject()
+        val flag = botFlagSource(auth.optString("accessToken"))
+        val cooldownUntil = meta.optDouble("cooldown_until", 0.0)
+        return JSONObject()
+            .put("uid", profile.optString("uid"))
+            .put("email", profile.optString("email").ifBlank { profile.optString("nickname") })
+            .put("enabled", enabled)
+            .put("bot_flag_source", flag)
+            .put("flagged", flag == 1)
+            .put("has_refresh_token", auth.optString("refreshToken").isNotBlank())
+            .put("token_parsable", jwtParsable(auth.optString("accessToken")))
+            .put("cooldown_remaining_sec", maxOf(0.0, cooldownUntil - System.currentTimeMillis() / 1000.0))
+            .put("failure_count", meta.optInt("failure_count", 0))
+    }
+
+    /**
+     * 全池风控体检：逐个解 JWT 找 bot_flag_source，并按设置自动停用被标记的号。
+     *
+     * 这是"号池卫生"的核心动作——被标记的号留在池里只会白吃调度、拉低成功率，还可能因反复失败
+     * 触发更多风控。**停用而非删除**，凭据保留便于人工复核。
+     */
+    fun riskScan(context: Context, disableFlagged: Boolean? = null): JSONObject {
+        val settings = store(context).getSettings()
+        val autoDisable = disableFlagged
+            ?: (settings.optString("farm_disable_on_bot_flag", "1") == "1")
+        val accounts = listAccounts(context)
+        val results = JSONArray()
+        var flagged = 0; var disabled = 0; var noRefresh = 0
+        for (i in 0 until accounts.length()) {
+            val meta = accounts.optJSONObject(i) ?: continue
+            val key = meta.optString("account_key")
+            val root = store(context).getAccountRoot(key) ?: continue
+            val enabled = meta.optInt("enabled", 1) == 1
+            val risk = accountRiskOf(root, enabled, meta)
+            if (risk.optBoolean("flagged")) {
+                flagged++
+                if (autoDisable && enabled) {
+                    store(context).setAccountEnabled(key, false)
+                    risk.put("action", "disabled")
+                    disabled++
+                } else {
+                    risk.put("action", "report_only")
+                }
+            }
+            if (!risk.optBoolean("has_refresh_token")) noRefresh++
+            results.put(risk)
+        }
+        return JSONObject()
+            .put("ok", true)
+            .put("total", accounts.length())
+            .put("flagged", flagged)
+            .put("disabled_now", disabled)
+            .put("without_refresh_token", noRefresh)
+            .put("auto_disable", autoDisable)
+            .put("results", results)
+    }
+
+    /**
+     * 账号健康检查（号池卫生）。
+     *
+     * 两级信号：
+     *  - **本地信号**（永远查，秒级）：JWT 的 bot_flag_source、refresh_token 是否缺失、
+     *    是否被停用、冷却剩余、连续失败次数。
+     *  - **上游探测**（`deep=true` 时逐个打上游）：验证凭据是否有效、是否被上游封禁、
+     *    还是只是额度耗尽。失败文案按社区口径分类：
+     *      · blocked-user / user is blocked → 账号已被封（必须出池）
+     *      · 401/403 且无 CF 特征           → 凭据失效（需重新授权）
+     *      · 纯 Cloudflare 拦截页           → IP 被盯（换出口即可，**不是号的问题**）
+     *      · tokens/limit 之类额度文案       → 额度耗尽（等窗口重置）
+     *
+     * 严重度：`dead`（必须清理）> `warning`（观察）> `healthy`。
+     * 「必须清理」= 被封 / 少了 refresh_token / 带 bot_flag —— 这类号留在池里只会白吃调度、
+     * 拉低成功率，还可能因反复失败招来更多风控。
+     */
+    fun accountHealth(context: Context, deep: Boolean = false): JSONObject {
+        val settings = store(context).getSettings()
+        val botFlagAction = settings.optString("risk_bot_flag_action", "warn")
+        val accounts = listAccounts(context)
+        val results = JSONArray()
+        var healthy = 0; var warning = 0; var dead = 0
+        val deadKeys = JSONArray()
+        for (i in 0 until accounts.length()) {
+            val meta = accounts.optJSONObject(i) ?: continue
+            val key = meta.optString("account_key")
+            val root = store(context).getAccountRoot(key) ?: continue
+            val risk = accountRiskOf(root, meta.optInt("enabled", 1) == 1, meta)
+            val reasons = JSONArray()
+            var severity = "healthy"
+
+            fun mark(level: String, reason: String) {
+                reasons.put(reason)
+                if (level == "dead") severity = "dead"
+                else if (level == "warning" && severity != "dead") severity = "warning"
+            }
+
+            if (!risk.optBoolean("token_parsable")) mark("dead", "access_token 非法（无法解析 JWT，凭据已损坏）")
+            // bot_flag 处置策略（默认 warn）：lij 已证 grok.com 的 botFlagSource 不可靠、
+            // chenyme 也只拿它选路由而非弃号 —— 所以默认只标记不判死，避免误杀好号。
+            if (risk.optBoolean("flagged")) {
+                when (botFlagAction) {
+                    "disable" -> mark("dead", "被 xAI 风控标记（bot_flag_source=1，按设置停用）")
+                    "ignore" -> Unit
+                    else -> mark("warning", "带风控标记（bot_flag_source=1）：建议降级使用，不必然失效")
+                }
+            }
+            if (!risk.optBoolean("has_refresh_token")) mark("dead", "缺少 refresh_token，凭据无法自动续期")
+            if (!risk.optBoolean("enabled")) mark("warning", "当前处于停用状态")
+            if (risk.optDouble("cooldown_remaining_sec", 0.0) > 0)
+                mark("warning", "冷却中，剩余 ${risk.optLong("cooldown_remaining_sec")}s")
+            val failures = risk.optInt("failure_count", 0)
+            if (failures >= 3) mark("warning", "连续失败 $failures 次")
+
+            if (deep && meta.optInt("enabled", 1) == 1) {
+                runCatching { refreshCredits(context, key) }.fold(
+                    onSuccess = { info ->
+                        val remain = info.optDouble("remain", 0.0)
+                        val total = info.optDouble("total", 0.0)
+                        if (total > 0 && remain <= 0) mark("warning", "额度已用尽（等窗口重置）")
+                    },
+                    onFailure = { err ->
+                        // 用统一分类器判定，避免"内容安全拒绝"之类软失败被误判成 dead
+                        val status = RiskLogic.statusFromMessage(err.message)
+                        val f = classifyUpstreamFailure(status, err.message ?: "")
+                        val text = (err.message ?: "").lowercase()
+                        if (text.contains("cloudflare") || text.contains("attention required")) {
+                            mark("warning", "Cloudflare 拦截：疑似出口 IP 被盯，先换节点再判断")
+                        } else when (f.kind) {
+                            "policy" -> mark("warning", "上游策略拒绝（$f.code）：号可用，本次请求不合规")
+                            "blocked" -> mark("dead", "上游封锁账号（$f.code）")
+                            "auth" -> mark("dead", "凭据被拒（$f.code），需重新授权")
+                            "quota", "rate" -> mark("warning", "额度/限流（$f.code），等待恢复探测")
+                            else -> mark("warning", "探测失败：${f.code}（${(err.message ?: "").take(60)}）")
+                        }
+                    }
+                )
+            }
+
+            if (severity == "dead") { dead++; deadKeys.put(key) }
+            else if (severity == "warning") warning++
+            else healthy++
+
+            val reasonText = (0 until reasons.length()).joinToString("；") { reasons.optString(it) }
+            store(context).setAccountRisk(key, severity, reasonText,
+                failureCode = risk.optString("last_failure_code"))
+            results.put(risk.put("severity", severity).put("reasons", reasons).put("account_key", key))
+        }
+        return JSONObject()
+            .put("ok", true)
+            .put("checked", accounts.length())
+            .put("deep", deep)
+            .put("healthy", healthy).put("warning", warning).put("dead", dead)
+            .put("need_cleanup", dead > 0)
+            .put("cleanup_keys", deadKeys)
+            .put("results", results)
+    }
+
+    /**
+     * 降智探测（参照 lij768423-svg/grok-register-panel 的 quality_probe）。
+     *
+     * 免费档被风控后常见表现不是报错，而是**"降智"**：回答变短、不再走推理。
+     * 所以判定质量要看"真实短对话里有没有 reasoning token"，而不是看 JWT 标记
+     * （后者已被证明不可靠）。四档结论：
+     *   healthy 有推理且正常返回 / risk 无推理（疑似降智）/ error 请求失败 / unknown 判不了
+     */
+    fun qualityProbe(context: Context, accountKey: String): JSONObject {
+        val model = store(context).getSettings().optString("quality_probe_model", "grok-4.6")
+        val started = System.currentTimeMillis()
+        return try {
+            val payload = JSONObject()
+                .put("model", model)
+                .put("stream", false)
+                .put("max_tokens", 64)
+                .put("messages", JSONArray().put(JSONObject()
+                    .put("role", "user")
+                    .put("content", "Reply with exactly: pong")))
+            // 复用现有上游调用原语：loadAccount → headersForFresh（含到期自动刷新）→ request → executeJson
+            val account = loadAccount(context, accountKey)
+                ?: throw IOException("账号不存在：$accountKey")
+            val headers = headersForFresh(context, account)
+            val raw = executeJson(request("${account.backend}/chat/completions", "POST", payload, headers))
+            val usage = raw.optJSONObject("usage") ?: JSONObject()
+            val details = usage.optJSONObject("completion_tokens_details") ?: JSONObject()
+            val reasoning = details.optInt("reasoning_tokens", 0)
+            val content = raw.optJSONArray("choices")?.optJSONObject(0)
+                ?.optJSONObject("message")?.optString("content").orEmpty()
+            val level = if (reasoning > 0) "healthy" else "risk"
+            store(context).setAccountRisk(accountKey, level,
+                if (reasoning > 0) "降智探测：有推理（${reasoning} reasoning tokens）"
+                else "降智探测：无推理输出，疑似降智")
+            JSONObject().put("ok", true).put("account_key", accountKey)
+                .put("verdict", if (reasoning > 0) "healthy" else "risk")
+                .put("reasoning_tokens", reasoning)
+                .put("content_head", content.take(60))
+                .put("elapsed_ms", System.currentTimeMillis() - started)
+        } catch (e: Exception) {
+            // 探测失败也走统一分类器：否则额度耗尽会被笼统记成"探测失败"，
+            // 拿不到恢复探测排期（真机实测踩到：429 free-usage-exhausted 被记成未知失败）。
+            val status = RiskLogic.statusFromMessage(e.message)
+            val f = RiskLogic.classifyUpstreamFailure(status, e.message ?: "")
+            val level = if (f.isAccountLevel) "dead" else "warning"
+            val now = System.currentTimeMillis() / 1000.0
+            store(context).setAccountRisk(
+                accountKey, level, "推理探测失败：${f.code}",
+                failureCode = f.code,
+                cooldownReason = f.kind,
+                nextProbeAt = if (f.isQuotaLike) now + 1800 else 0.0,
+            )
+            JSONObject().put("ok", false).put("account_key", accountKey)
+                .put("verdict", "error").put("code", f.code).put("kind", f.kind)
+                .put("error", e.message?.take(200))
+                .put("elapsed_ms", System.currentTimeMillis() - started)
+        }
+    }
+
+    /** 对号池批量降智探测（最多 limit 个，优先未体检的）。 */
+    fun qualityProbeAll(context: Context, limit: Int = 5): JSONObject {
+        val out = JSONArray()
+        val accounts = listAccounts(context)
+        var n = 0
+        for (i in 0 until accounts.length()) {
+            if (n >= limit) break
+            val meta = accounts.optJSONObject(i) ?: continue
+            if (meta.optInt("enabled", 1) != 1) continue
+            val key = meta.optString("account_key")
+            out.put(qualityProbe(context, key))
+            n++
+        }
+        return JSONObject().put("ok", true).put("probed", n).put("results", out)
+    }
+
+    /** 号池概览（面板顶部卡片）：各状态计数 + 冷却/探测/额度汇总。 */
+    fun poolSummary(context: Context): JSONObject {
+        val accounts = listAccounts(context)
+        var healthy = 0; var warning = 0; var dead = 0; var unchecked = 0
+        var disabled = 0; var cooling = 0; var quotaOut = 0; var flagged = 0
+        val now = System.currentTimeMillis() / 1000.0
+        for (i in 0 until accounts.length()) {
+            val a = accounts.optJSONObject(i) ?: continue
+            when (a.optString("risk_level")) {
+                "dead" -> dead++; "warning" -> warning++; "healthy" -> healthy++; else -> unchecked++
+            }
+            if (a.optInt("enabled", 1) != 1) disabled++
+            if (a.optDouble("cooldown_until", 0.0) > now) cooling++
+            if (a.optString("cooldown_reason") == "quota") quotaOut++
+            if (a.optInt("bot_risk", 0) == 1) flagged++
+        }
+        val total = accounts.length()
+        // 可用率口径：可调度（启用且不在冷却）占启用号的比例——面板只看这个数就能判断池子健康
+        var usable = 0
+        for (i in 0 until total) {
+            val a = accounts.optJSONObject(i) ?: continue
+            if (a.optInt("enabled", 1) == 1 && a.optDouble("cooldown_until", 0.0) <= now) usable++
+        }
+        val quota = quotaOverview(context)
+        var used = 0L; var limit = 0L
+        for (i in 0 until quota.length()) {
+            val q = quota.optJSONObject(i) ?: continue
+            if (q.optBoolean("enabled", true)) {
+                used += q.optLong("used"); limit += q.optLong("limit")
+            }
+        }
+        return JSONObject()
+            .put("ok", true)
+            .put("total", total).put("healthy", healthy).put("warning", warning)
+            .put("dead", dead).put("unchecked", unchecked)
+            .put("disabled", disabled).put("cooling", cooling)
+            .put("quota_exhausted", quotaOut).put("bot_flagged", flagged)
+            .put("usable", usable)
+            .put("usable_ratio", if (total > 0) usable.toDouble() / total else 0.0)
+            .put("tokens_used", used).put("tokens_limit", limit)
+            .put("tokens_remaining", (limit - used).coerceAtLeast(0))
+    }
+
+    /** 批量删除账号（健康检查后清理用）。返回真正删掉的 account_key。 */
+    fun deleteAccounts(context: Context, keys: List<String>): JSONArray {
+        val removed = JSONArray()
+        keys.forEach { if (store(context).deleteAccount(it)) removed.put(it) }
+        return removed
+    }
+
+    /** 批量停用/启用账号，返回影响条数。 */
+    fun setAccountsEnabled(context: Context, keys: List<String>, enabled: Boolean): Int {
+        var n = 0
+        keys.forEach { if (store(context).setAccountEnabled(it, enabled)) n++ }
+        return n
+    }
+
+    /** 农场运行状态：容量、节流余量、累计导入。供 PC 侧管道与界面展示。 */
+    fun farmStatus(context: Context): JSONObject {
+        val settings = store(context).getSettings()
+        val pool = listAccounts(context).length()
+        val maxAccounts = settings.optString("farm_max_accounts", "60").toIntOrNull() ?: 60
+        val gap = settings.optString("farm_import_min_gap_sec", "300").toLongOrNull() ?: 300L
+        val lastImport = settings.optString("farm_last_import_ts", "0").toDoubleOrNull() ?: 0.0
+        val nowSec = System.currentTimeMillis() / 1000.0
+        val sinceLast = if (lastImport > 0) nowSec - lastImport else -1.0
+        val remaining = if (lastImport > 0) maxOf(0.0, gap - sinceLast) else 0.0
+        return JSONObject()
+            .put("ok", true)
+            .put("pool_count", pool)
+            .put("max_accounts", maxAccounts)
+            .put("capacity_left", maxOf(0, maxAccounts - pool))
+            .put("import_gap_sec", gap)
+            .put("seconds_since_last_import", if (sinceLast < 0) JSONObject.NULL else sinceLast.toLong())
+            .put("throttle_remaining_sec", remaining.toLong())
+            .put("can_import_now", remaining <= 0.0 && pool < maxAccounts)
+            .put("imported_total", settings.optString("farm_imported_total", "0").toIntOrNull() ?: 0)
+            .put("reject_bot_flag", settings.optString("farm_reject_bot_flag", "1") == "1")
+            .put("auto_disable_on_bot_flag", settings.optString("farm_disable_on_bot_flag", "1") == "1")
+    }
+
+    /**
+     * PC 侧自动注册管道专用的导入守卫：容量上限 → 节流间隔 → 逐个查 bot_flag → 落库。
+     *
+     * 相比裸 [importAccounts] 就多这三道闸。触发节流时返回 `reason=throttled` 与还需等待秒数，
+     * 让调用方（farm.py）自行 sleep 重试，而不是当成失败退出。
+     */
+    fun importAccountsGuarded(context: Context, documents: JSONArray): JSONObject {
+        val settings = store(context).getSettings()
+        val pool = listAccounts(context).length()
+        val maxAccounts = settings.optString("farm_max_accounts", "60").toIntOrNull() ?: 60
+        if (pool >= maxAccounts) {
+            return JSONObject().put("ok", false).put("reason", "pool_full")
+                .put("pool_count", pool).put("max_accounts", maxAccounts)
+                .put("imported", JSONArray()).put("rejected", JSONArray())
+        }
+        val gap = settings.optString("farm_import_min_gap_sec", "300").toLongOrNull() ?: 300L
+        val lastImport = settings.optString("farm_last_import_ts", "0").toDoubleOrNull() ?: 0.0
+        val nowSec = System.currentTimeMillis() / 1000.0
+        val since = if (lastImport > 0) nowSec - lastImport else Double.MAX_VALUE
+        if (since < gap) {
+            return JSONObject().put("ok", false).put("reason", "throttled")
+                .put("retry_after_sec", (gap - since).toLong())
+                .put("import_gap_sec", gap)
+                .put("imported", JSONArray()).put("rejected", JSONArray())
+        }
+
+        val rejectFlagged = settings.optString("farm_reject_bot_flag", "1") == "1"
+        val cleaned = JSONArray(); val preRejected = JSONArray()
+        for (i in 0 until documents.length()) {
+            val raw = when (val item = documents.opt(i)) {
+                is JSONObject -> item
+                is String -> runCatching { JSONObject(item) }.getOrNull()
+                else -> null
+            }
+            if (raw == null) {
+                preRejected.put(JSONObject().put("index", i).put("error", "无效 JSON")); continue
+            }
+            val normalized = runCatching { normalizeImportedAccount(raw) }.getOrNull()
+            val token = normalized?.optJSONObject("auth")?.optString("accessToken").orEmpty()
+            if (rejectFlagged && botFlagSource(token) == 1) {
+                preRejected.put(JSONObject().put("index", i)
+                    .put("error", "bot_flag_source=1（已被 xAI 风控标记，弃号不入池）"))
+                continue
+            }
+            cleaned.put(raw)
+        }
+        val result = importAccounts(context, cleaned)
+        val imported = result.optJSONArray("imported") ?: JSONArray()
+        val rejected = result.optJSONArray("rejected") ?: JSONArray()
+        for (i in 0 until preRejected.length()) rejected.put(preRejected.getJSONObject(i))
+        if (imported.length() > 0) {
+            val total = (settings.optString("farm_imported_total", "0").toIntOrNull() ?: 0) + imported.length()
+            store(context).saveSettings(JSONObject()
+                .put("farm_last_import_ts", (System.currentTimeMillis() / 1000).toString())
+                .put("farm_imported_total", total.toString()))
+        }
+        return JSONObject()
+            .put("ok", imported.length() > 0)
+            .put("reason", if (imported.length() > 0) "imported" else "nothing_imported")
+            .put("imported", imported).put("rejected", rejected)
+            .put("skipped_flagged", preRejected.length())
+            .put("pool_count", listAccounts(context).length())
+    }
+
     private fun epochOrNull(text: String): Long? {
         runCatching { java.time.Instant.parse(text).toEpochMilli() / 1000 }.onSuccess { return it }
         return text.toLongOrNull()
@@ -846,7 +1441,11 @@ object NativeCore {
             }
             throw IOException(errors.ifBlank { "全部账号额度刷新失败" })
         }
-        return JSONObject().put("results", results).put("summary", creditsSummary(context))
+        // 顺带做一次"额度恢复探测"：把冷却已到期、且属于额度/限流类的号试着拉回池子。
+        // 参照 chenyme 的 quota recovery —— 不靠时间估算硬冻，靠真实探测恢复。
+        val recovery = runCatching { probeRecoverableAccounts(context, limit = 5) }.getOrNull()
+
+        return JSONObject().put("results", results).put("recovery", recovery ?: JSONObject()).put("summary", creditsSummary(context))
     }
 
     /**

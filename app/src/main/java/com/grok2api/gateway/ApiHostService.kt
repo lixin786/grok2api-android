@@ -271,6 +271,117 @@ class ApiHostService : Service() {
                     }
                     json(output, 401, apiError("无效或缺失 API Key", "authentication_error"))
                 }
+                // 本地账号管理端点（用应用 Key 鉴权）——供 PC 侧自动化管道把注册好的
+                // 账号直接推进号池，省掉手机上手动「导入 auth 文件」的往返。
+                method == "GET" && path == "/admin/accounts" -> {
+                    val list = NativeCore.listAccounts(this)
+                    json(output, 200, JSONObject().put("ok", true).put("count", list.length())
+                        .put("accounts", list))
+                }
+                method == "POST" && path == "/admin/accounts/import" -> {
+                    val payload = parseBody(bodyText)
+                    val incoming = JSONArray()
+                    val many = payload.optJSONArray("accounts")
+                    if (many != null) {
+                        for (i in 0 until many.length()) incoming.put(many.getJSONObject(i))
+                    } else {
+                        incoming.put(payload)
+                    }
+                    // 走带风控守卫的导入：容量上限 → 节流间隔 → bot_flag 弃号 → 落库
+                    val result = NativeCore.importAccountsGuarded(this, incoming)
+                    val reason = result.optString("reason")
+                    Log.i(TAG, "POST /admin/accounts/import -> reason=$reason pool=${result.optInt("pool_count")}")
+                    val status = if (reason == "throttled" || reason == "pool_full") 429 else 200
+                    json(output, status, result)
+                }
+                method == "GET" && path == "/admin/risk" -> {
+                    // 风控配置 + 社区实证的规避要点（供 PC 侧管道与界面共用同一份口径）
+                    val settings = NativeCore.store(this).getSettings()
+                    val guidance = JSONArray()
+                        .put("同 IP 连续注册是最大封号触发器：导入间隔遵循 farm_import_min_gap_sec（默认 300s）")
+                        .put("批前先跑 1 个号做 canary，失败立即停批，避免协议变更时白烧号")
+                        .put("入池前查 JWT bot_flag_source：为 1 的号弃用（媒体能力会被降级，且更易失效）")
+                        .put("403 分类：含 blocked-user 视为账号被封（换号+长冷却）；纯 Cloudflare 页面是 IP 被盯，换出口而非弃号")
+                        .put("refresh_token 会轮换：同一凭据不要在多个客户端共用，否则 invalid_grant 断链")
+                        .put("IP 稳定性优先于 IP 干净度：一个账号的全生命周期尽量固定同一出口")
+                        .put("入池后不要反复重新授权：同一设备频繁登录多个 Grok 账号会触发上游风控")
+                    json(output, 200, JSONObject()
+                        .put("ok", true)
+                        .put("import_gap_sec", settings.optString("farm_import_min_gap_sec", "300"))
+                        .put("max_accounts", settings.optString("farm_max_accounts", "60"))
+                        .put("reject_bot_flag", settings.optString("farm_reject_bot_flag", "1"))
+                        .put("disable_on_bot_flag", settings.optString("farm_disable_on_bot_flag", "1"))
+                        .put("guidance", guidance))
+                }
+                method == "POST" && path == "/admin/risk/scan" -> {
+                    val payload = runCatching { parseBody(bodyText) }.getOrNull()
+                    val disableFlagged = payload?.optBoolean("disable_flagged")
+                    val report = NativeCore.riskScan(this, disableFlagged)
+                    Log.i(TAG, "POST /admin/risk/scan -> total=${report.optInt("total")} flagged=${report.optInt("flagged")}")
+                    json(output, 200, report)
+                }
+                method == "GET" && path == "/admin/farm/status" -> {
+                    json(output, 200, NativeCore.farmStatus(this))
+                }
+                method == "POST" && path == "/admin/accounts/health" -> {
+                    // 账号健康检查：deep=true 时逐个打上游探测（慢），默认只查本地信号
+                    val payload = runCatching { parseBody(bodyText) }.getOrNull()
+                    val deep = payload?.optBoolean("deep") ?: false
+                    val report = NativeCore.accountHealth(this, deep)
+                    Log.i(TAG, "POST /admin/accounts/health deep=$deep -> checked=${report.optInt("checked")} dead=${report.optInt("dead")}")
+                    json(output, 200, report)
+                }
+                method == "POST" && path == "/admin/accounts/cleanup" -> {
+                    // 清理：按 health 报告的 account_key 删除或停用
+                    val payload = parseBody(bodyText)
+                    val keys = mutableListOf<String>()
+                    payload.optJSONArray("keys")?.let { arr ->
+                        for (i in 0 until arr.length()) keys.add(arr.optString(i))
+                    }
+                    if (keys.isEmpty()) throw ClientError("keys is required")
+                    val mode = payload.optString("mode", "disable")
+                    val result = if (mode == "delete") {
+                        JSONObject().put("mode", "delete")
+                            .put("removed", NativeCore.deleteAccounts(this, keys))
+                    } else {
+                        JSONObject().put("mode", "disable")
+                            .put("disabled", NativeCore.setAccountsEnabled(this, keys, false))
+                    }
+                    Log.i(TAG, "POST /admin/accounts/cleanup mode=$mode keys=${keys.size}")
+                    json(output, 200, result.put("ok", true)
+                        .put("pool_count", NativeCore.listAccounts(this).length()))
+                }
+                method == "GET" && path == "/admin/pool/summary" -> {
+                    // 面板顶部概览：各风控状态计数 + 可用率 + 额度汇总
+                    json(output, 200, NativeCore.poolSummary(this))
+                }
+                method == "POST" && path == "/admin/accounts/quality" -> {
+                    // 降智探测（真实短对话看有无 reasoning token）——bot_flag 之外的最终质量判定
+                    val payload = runCatching { parseBody(bodyText) }.getOrNull()
+                    val keys = mutableListOf<String>()
+                    payload?.optJSONArray("keys")?.let { arr ->
+                        for (i in 0 until arr.length()) keys.add(arr.optString(i))
+                    }
+                    val report = if (keys.isNotEmpty()) {
+                        val out = org.json.JSONArray()
+                        keys.forEach { out.put(NativeCore.qualityProbe(this, it)) }
+                        JSONObject().put("ok", true).put("probed", keys.size).put("results", out)
+                    } else {
+                        NativeCore.qualityProbeAll(this, payload?.optInt("limit") ?: 5)
+                    }
+                    Log.i(TAG, "POST /admin/accounts/quality -> probed=${report.optInt("probed")}")
+                    json(output, 200, report)
+                }
+                method == "POST" && path == "/admin/accounts/failure" -> {
+                    // 供 PC 侧/调试上报一次上游失败，走统一分类器落库（冷却分级 + 失败码）
+                    val payload = parseBody(bodyText)
+                    val key = payload.optString("account_key")
+                    if (key.isBlank()) throw ClientError("account_key is required")
+                    val f = NativeCore.applyUpstreamFailure(this, key,
+                        payload.optInt("status"), payload.optString("body"))
+                    json(output, 200, JSONObject().put("ok", true)
+                        .put("code", f.code).put("kind", f.kind))
+                }
                 method == "GET" && path == "/v1/models" -> {
                     val region = AccountRegion.fromStrict(selectedApp.optString("region"))
                     val started = System.currentTimeMillis()

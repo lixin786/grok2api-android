@@ -20,8 +20,8 @@ android {
         applicationId = "com.grok2api.gateway"
         minSdk = 24
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.2.3"
+        versionCode = 17
+        versionName = "1.5.3-test"
     }
 
     signingConfigs {
@@ -53,4 +53,6 @@ android {
 
 dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")   // JVM 单测里补上 Android 才有的 org.json
 }

@@ -51,6 +51,12 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         // quota_confirmed_used 记录上游耗尽响应里带出的真实已用量（NULL = 尚未被上游确认过）。
         ensureColumn(db, "accounts", "quota_limit_tokens", "INTEGER")
         ensureColumn(db, "accounts", "quota_confirmed_used", "INTEGER")
+        // 号池维护用的风控状态（由健康检查/失败分类写入，面板按它排序与着色）
+        ensureColumn(db, "accounts", "risk_level", "TEXT NOT NULL DEFAULT ''")
+        ensureColumn(db, "accounts", "risk_reason", "TEXT NOT NULL DEFAULT ''")
+        ensureColumn(db, "accounts", "last_failure_code", "TEXT NOT NULL DEFAULT ''")
+        ensureColumn(db, "accounts", "cooldown_reason", "TEXT NOT NULL DEFAULT ''")
+        ensureColumn(db, "accounts", "next_probe_at", "REAL NOT NULL DEFAULT 0")
         ensureColumn(db, "apps", "key_enc", "TEXT NOT NULL DEFAULT ''")
         ensureColumn(db, "apps", "region", "TEXT NOT NULL DEFAULT 'domestic'")
         ensureColumn(db, "apps", "updated_at", "REAL NOT NULL DEFAULT 0")
@@ -153,7 +159,9 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         val profile = root.optJSONObject("account") ?: auth.optJSONObject("account") ?: JSONObject()
         val uid = profile.optString("uid").trim()
         require(uid.isNotEmpty()) { "auth 文件缺少 account.uid" }
-        require(auth.optString("accessToken").isNotBlank()) { "auth 文件缺少 accessToken" }
+        require(auth.optString("accessToken").isNotBlank() || auth.optString("refreshToken").isNotBlank()) {
+            "auth 文件缺少 accessToken（至少需要 accessToken 或 refreshToken）"
+        }
         val region = AccountRegion.infer(requestedRegion ?: root.optString("region"), auth.optString("domain")).id
         root.put("region", region)
         val now = nowSeconds()
@@ -184,7 +192,12 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
 
     fun listAccounts(): JSONArray = synchronized(lock) {
         val out = JSONArray()
-        readableDatabase.rawQuery("SELECT * FROM accounts ORDER BY priority DESC,id ASC", null).use { c ->
+        // 面板排序：先按风控严重度（dead 置顶、warning 次之、未体检/健康在后），再按优先级。
+        readableDatabase.rawQuery(
+            "SELECT * FROM accounts ORDER BY " +
+                "CASE risk_level WHEN 'dead' THEN 0 WHEN 'warning' THEN 1 WHEN '' THEN 2 ELSE 3 END, " +
+                "priority DESC, id ASC", null
+        ).use { c ->
             while (c.moveToNext()) out.put(accountJson(c).apply { remove("auth_json") })
         }
         out
@@ -202,6 +215,64 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
     fun deleteAccount(accountKey: String): Boolean = synchronized(lock) {
         val (region, uid) = splitAccountKey(accountKey)
         writableDatabase.delete("accounts", "region=? AND uid=?", arrayOf(region, uid)) > 0
+    }
+
+    /** 写入体检结论（面板徽章/排序依据）。 */
+    fun setAccountRisk(accountKey: String, level: String, reason: String,
+                       failureCode: String = "", cooldownReason: String = "",
+                       nextProbeAt: Double = 0.0): Boolean =
+        updateAccount(accountKey, ContentValues().apply {
+            put("risk_level", level)
+            put("risk_reason", reason.take(300))
+            put("last_failure_code", failureCode)
+            put("cooldown_reason", cooldownReason)
+            put("next_probe_at", nextProbeAt)
+        })
+
+    /** 只更冷却相关字段（失败分类后调用）。 */
+    fun setAccountCooldown(accountKey: String, cooldownUntil: Double,
+                           reason: String, failureCode: String): Boolean =
+        updateAccount(accountKey, ContentValues().apply {
+            put("cooldown_until", cooldownUntil)
+            put("cooldown_reason", reason)
+            put("last_failure_code", failureCode)
+        })
+
+    /**
+     * 凭据续期的乐观写回（防 RT 轮换丢链）。
+     *
+     * 参照 grok2api 的做法：刷新前记下所用的 refreshToken，写回时先重读当前值，
+     * **若已被别人轮换过就放弃本次写入** —— 否则会把上游已作废的旧 RT 覆盖回去，
+     * 导致 refresh-token 链永久断裂（表现为账号莫名 reauthRequired）。
+     * 本进程内由 store 锁保证读-比-写原子；跨进程（PC 侧同时改库）场景不适用，故仅在此做防护。
+     */
+    fun updateAuthIfRefreshUnchanged(accountKey: String, expectedRefreshToken: String,
+                                     newAuthJson: String): Boolean = synchronized(lock) {
+        val (region, uid) = splitAccountKey(accountKey)
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            var current = ""
+            db.rawQuery("SELECT auth_json FROM accounts WHERE region=? AND uid=?", arrayOf(region, uid)).use { c ->
+                if (c.moveToFirst()) current = c.getString(0) ?: ""
+            }
+            if (current.isBlank()) return@synchronized false
+            val curRt = runCatching {
+                JSONObject(current).optJSONObject("auth")?.optString("refreshToken").orEmpty()
+            }.getOrDefault("")
+            if (expectedRefreshToken.isNotBlank() && curRt != expectedRefreshToken) {
+                // 已被其他路径轮换过：本次结果作废，保留库里的新值
+                return@synchronized false
+            }
+            val ok = db.update("accounts", ContentValues().apply {
+                put("auth_json", newAuthJson)
+                put("updated_at", nowSeconds())
+            }, "region=? AND uid=?", arrayOf(region, uid)) > 0
+            db.setTransactionSuccessful()
+            ok
+        } finally {
+            db.endTransaction()
+        }
     }
 
     fun setAccountEnabled(accountKey: String, enabled: Boolean): Boolean = updateAccount(accountKey, ContentValues().apply {
@@ -700,6 +771,13 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
             botRiskSourceFromToken(token)
         }.getOrDefault(0)
         put("bot_risk", jwt)
+        // 面板用的风控状态：risk_level 为 '' 表示尚未体检（UI 显示"未体检"而不是"健康"）
+        put("risk_level", optString("risk_level"))
+        put("risk_reason", optString("risk_reason"))
+        put("last_failure_code", optString("last_failure_code"))
+        put("cooldown_reason", optString("cooldown_reason"))
+        put("next_probe_at", optDouble("next_probe_at", 0.0))
+        put("cooldown_remaining_sec", maxOf(0.0, optDouble("cooldown_until") - nowSeconds()))
         put("credit_packages", runCatching { JSONArray(optString("credit_packages_json")) }.getOrDefault(JSONArray())); remove("credit_packages_json")
     }
     private fun accountKey(region: String, uid: String): String = "$region:$uid"
@@ -776,14 +854,36 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         // v10：新增 model_health 表。注意每次改 schema 必须同步 bump 此版本号——
         // 否则覆盖安装时 SQLite 不会回调 onCreate/onUpgrade，新表建不出来，
         // 运行期查询直接抛 no such table（v1.2.1 真实踩坑：刷新模型整个失败）。
-        private const val DATABASE_VERSION = 10
+        // v11：新增号池风控状态列（risk_level/risk_reason/last_failure_code/
+        // cooldown_reason/next_probe_at）——面板徽章、异常置顶与恢复探测都依赖它们。
+        // 注意：新增 ensureColumn 必须同时升这个版本号，否则老库不会执行迁移（踩过）。
+        private const val DATABASE_VERSION = 11
         private const val KEY_ALIAS = "grok_native_app_keys"
         /** 优先级下限：0 = 不额外加权（选号权重 = 1.0）。 */
         const val MIN_PRIORITY = 0
         /** 优先级上限：兜底防止误写极端值，让加权随机退化成固定选号。 */
         const val MAX_PRIORITY = 999
         /** saveSettings 只接受本表内的 key，新增配置项必须同时加到 here 与设置页控件。 */
-        private val DEFAULT_SETTINGS = mapOf("checkin_hours" to "9,21", "credit_refresh_min" to "30", "model_refresh_hour" to "6", "model_ttl_min" to "60", "aa_refresh_hour" to "7", "keepalive_hour" to "22", "keepalive_enabled" to "1", "aa_api_key" to "", "usage_retention_days" to "30", "free_token_limit" to "500000")
+        private val DEFAULT_SETTINGS = mapOf("checkin_hours" to "9,21", "credit_refresh_min" to "30", "model_refresh_hour" to "6", "model_ttl_min" to "60", "aa_refresh_hour" to "7", "keepalive_hour" to "22", "keepalive_enabled" to "1", "aa_api_key" to "", "usage_retention_days" to "30", "free_token_limit" to "500000",
+            // 号池风控 / 农场（PC 侧自动注册管道与本地体检共用）
+            //  farm_import_min_gap_sec    两次导入最小间隔秒数 —— 规避同 IP 连续注册触发上游风控
+            //  farm_max_accounts          号池容量上限 —— 防无限膨胀
+            //  farm_reject_bot_flag       导入时拒绝 access_token 带 bot_flag_source=1 的号
+            //  farm_disable_on_bot_flag   体检发现被标记的号自动停用（出池）
+            //  farm_last_import_ts / farm_imported_total   节流与统计用的运行状态
+            "farm_import_min_gap_sec" to "300", "farm_max_accounts" to "60",
+            //  风控分级与判定策略（参照开源项目实践）
+            //   risk_bot_flag_action  bot_flag 命中时的动作：warn 仅标记(默认) / disable 停用 / ignore 忽略
+            //                        —— lij 已证 grok.com 的 botFlagSource 不可靠，chenyme 也只拿它选路由；
+            //                        故默认不再"一票弃号"，仅标记 + 降低调度优先级
+            //   cooldown_network_sec 基础设施抖动（超时/5xx/连接失败）的短冷却
+            //   cooldown_risk_sec    上游风控类（限流/封锁/凭据被拒）的长冷却
+            //   quality_probe_*      降智探测：真实短对话流式请求，看有没有 reasoning token
+            "risk_bot_flag_action" to "warn", "cooldown_network_sec" to "90",
+            "cooldown_risk_sec" to "1800", "quality_probe_enabled" to "0",
+            "quality_probe_model" to "grok-4.6",
+            "farm_reject_bot_flag" to "1", "farm_disable_on_bot_flag" to "1",
+            "farm_last_import_ts" to "0", "farm_imported_total" to "0")
         /**
          * 记录内容字段的入库上限。取值理由：
          * - 输入 4000 字符 ≈ 一整轮较长对话；截断只影响超长多轮历史，日常排查完全够用。
