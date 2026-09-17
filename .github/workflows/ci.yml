@@ -52,5 +52,12 @@ jobs:
           echo "sdk=$SDK sdkmanager=$SDKMGR"
           yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
           "$SDKMGR" "platforms;android-36" "build-tools;36.0.0" > /dev/null
+      # 仓库不含任何签名文件（debug.keystore 已 gitignore），CI 里现生成一个临时 debug 签名，
+      # 只为验证 release 打包+混淆链路能跑通，产物不作分发。
+      - name: 生成临时 debug keystore
+        run: |
+          keytool -genkeypair -v -keystore app/debug.keystore -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
       - name: 编译 release（确保混淆规则不炸）
         run: ./gradlew assembleRelease --no-daemon
