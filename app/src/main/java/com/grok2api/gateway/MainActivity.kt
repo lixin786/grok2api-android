@@ -614,6 +614,10 @@ class MainActivity : Activity() {
 
     private fun morePage(): View = page {
         addView(card {
+            addView(menuRow("⚡", "产号", "自动注册账号并入号池（1.6.0-farm-test 实验功能）") {
+                startActivity(android.content.Intent(this@MainActivity, FarmActivity::class.java))
+            })
+            addView(divider())
             addView(menuRow("▥", "用量", "请求、Tokens 与额度概览") { render(Page.USAGE) })
             addView(divider())
             addView(menuRow("⌁", "应用", "API Key 与接入配置") { render(Page.APPS) })
@@ -1562,12 +1566,13 @@ class MainActivity : Activity() {
         }, REQ_AUTH)
     }
 
-    /** 一键导入：放宽选择器（json/文本都能选），交给多格式解析器识别。 */
+    /** 一键导入：多选文件（json/文本混选），交给多格式解析器识别后合并导入。 */
     private fun chooseImport() {
         startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
             putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/json", "text/plain", "application/octet-stream"))
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         }, REQ_IMPORT)
     }
 
@@ -1628,7 +1633,15 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_AUTH && resultCode == RESULT_OK) data?.data?.let { importAuth(it) }
-        if (requestCode == REQ_IMPORT && resultCode == RESULT_OK) data?.data?.let { importAuth(it) }
+        if (requestCode == REQ_IMPORT && resultCode == RESULT_OK) {
+            // 多选导入：EXTRA_ALLOW_MULTIPLE 时 getClipData 有多个 URI；单选回退 data.data
+            val uris = ArrayList<Uri>()
+            val clip = data?.clipData
+            if (clip != null) for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri)
+            else data?.data?.let { uris.add(it) }
+            if (uris.size == 1) importAuth(uris[0])
+            else if (uris.size > 1) importAuthMultiple(uris)
+        }
         if (requestCode == REQ_EXPORT && resultCode == RESULT_OK) data?.data?.let { writeExport(it) }
     }
 
@@ -1660,6 +1673,48 @@ class MainActivity : Activity() {
             append("已导入 ${imported.length()}")
             if (failures.length() > 0) append("，失败 ${failures.length()}（${failures.optJSONObject(0)?.optString("error")}）")
             if (rejected.length() > 0) append("；另有 ${rejected.length()} 条无法解析")
+        }
+    }
+
+    /**
+     * 多文件批量导入：所有选中文件的文本按行合并后交给 parseImportText 一次性解析导入。
+     * 典型场景：taixu 注册机产出的多份 accounts.jsonl / 导出文件一起选进来。
+     */
+    private fun importAuthMultiple(uris: List<Uri>) = runTask("批量导入 ${uris.size} 个文件", Page.ACCOUNTS) {
+        require(uris.size <= 20) { "一次最多导入 20 个文件" }
+        val maxPer = 1024 * 1024
+        val sb = StringBuilder()
+        var fileCount = 0
+        for (uri in uris) {
+            val text = contentResolver.openInputStream(uri)?.use { stream ->
+                val bytes = stream.readNBytes(maxPer + 1)
+                require(bytes.size <= maxPer) { "单个文件不能超过 1 MB" }
+                bytes.toString(Charsets.UTF_8)
+            } ?: continue
+            if (sb.isNotEmpty()) sb.append("\n")
+            sb.append(text)
+            fileCount++
+        }
+        require(fileCount > 0) { "无法读取任何所选文件" }
+        val result = NativeCore.parseImportText(sb.toString())
+        val accepted = result.first
+        val rejected = result.second
+        if (accepted.length() == 0) {
+            val detail = if (rejected.length() > 0) rejected.optJSONObject(0)?.optString("error") else null
+            throw IllegalStateException(detail ?: "$fileCount 个文件中没有可识别的账号")
+        }
+        val imported = JSONArray()
+        val failures = JSONArray()
+        for (i in 0 until accepted.length()) {
+            runCatching { NativeCore.saveAccount(this, accepted.getJSONObject(i)) }
+                .onSuccess { imported.put(it.uid) }
+                .onFailure { failures.put(JSONObject().put("index", i).put("error", it.message ?: "入库失败")) }
+        }
+        require(imported.length() > 0) { failures.optJSONObject(0)?.optString("error") ?: "全部账号入库失败" }
+        buildString {
+            append("$fileCount 个文件共导入 ${imported.length()} 个账号")
+            if (failures.length() > 0) append("，失败 ${failures.length()}")
+            if (rejected.length() > 0) append("；${rejected.length()} 条无法解析")
         }
     }
 

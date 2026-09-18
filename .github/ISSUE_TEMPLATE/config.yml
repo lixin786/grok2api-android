@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 用法讨论 / 提问
+    url: https://github.com/lixin786/grok2api-android/discussions
+    about: 安装、配置、怎么用好号池这类开放问题，去 Discussions 更合适
+  - name: 📖 先看文档
+    url: https://github.com/lixin786/grok2api-android#快速开始
+    about: 构建、启动网关、凑号三条路、设置项说明都在 README 里

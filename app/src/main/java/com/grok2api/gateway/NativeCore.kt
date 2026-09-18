@@ -539,7 +539,8 @@ object NativeCore {
                 saveAccount(context, account.root, AccountRegion.XAI)
             }
         } catch (e: Exception) {
-            store(context).markAccountFailure(account.key, 60)
+            store(context).markAccountFailure(account.key, 60,
+                reason = "auth", failureCode = "token_refresh_failed")
             throw e
         }
     }
@@ -702,6 +703,20 @@ object NativeCore {
         // Build OAuth 账号恒有 composer，上游目录偶尔不列它，缺了就补上
         if (!ordered.containsKey("grok-composer-2.5-fast")) {
             ordered["grok-composer-2.5-fast"] = XaiProtocol.modelEntry("grok-composer-2.5-fast")
+        }
+        // **合并而非覆盖**：上游目录按账号/档位/灰度不同（chenyme 的 README 有实证），
+        // 早先用"当次选中账号"的目录直接覆盖全量缓存，刷到稀疏目录就会让模型"消失"，
+        // 客户端表现成"模型忽然失效"。这里与现有缓存取并集，只增不减。
+        runCatching {
+            val prev = store(context).getModelCache(allowExpired = true, region = region.id)
+                ?.optJSONArray("models")
+            if (prev != null) {
+                for (i in 0 until prev.length()) {
+                    val item = prev.optJSONObject(i) ?: continue
+                    val id = item.optString("id")
+                    if (id.isNotBlank() && !ordered.containsKey(id)) ordered[id] = item
+                }
+            }
         }
         val models = XaiProtocol.withEffortAliases(ordered.values.toList())
         val ttl = store(context).getSettings().optLong("model_ttl_min", 60).coerceIn(1, 1440) * 60
@@ -959,13 +974,13 @@ object NativeCore {
             else -> "warning"
         }
         val reason = when (f.kind) {
-            "blocked" -> "上游封锁账号（$f.code）"
-            "auth" -> "凭据被拒（$f.code），需重新授权"
-            "quota" -> "额度耗尽（$f.code），等待恢复探测"
-            "rate" -> "上游限流（$f.code）"
-            "server" -> "上游 5xx（$f.code）"
-            "transport" -> "传输异常（$f.code）"
-            else -> "未知失败（$f.code）"
+            "blocked" -> "上游封锁账号（${f.code}）"
+            "auth" -> "凭据被拒（${f.code}），需重新授权"
+            "quota" -> "额度耗尽（${f.code}），等待恢复探测"
+            "rate" -> "上游限流（${f.code}）"
+            "server" -> "上游 5xx（${f.code}）"
+            "transport" -> "传输异常（${f.code}）"
+            else -> "未知失败（${f.code}）"
         }
         store(context).setAccountRisk(accountKey, level, reason, f.code,
             cooldownReason = f.kind,
@@ -1129,8 +1144,15 @@ object NativeCore {
             }
             if (!risk.optBoolean("has_refresh_token")) mark("dead", "缺少 refresh_token，凭据无法自动续期")
             if (!risk.optBoolean("enabled")) mark("warning", "当前处于停用状态")
-            if (risk.optDouble("cooldown_remaining_sec", 0.0) > 0)
-                mark("warning", "冷却中，剩余 ${risk.optLong("cooldown_remaining_sec")}s")
+            if (risk.optDouble("cooldown_remaining_sec", 0.0) > 0) {
+                // 带上原因与失败码：只说"冷却中"用户无法判断该等还是该换号
+                val why = listOfNotNull(
+                    meta.optString("cooldown_reason").takeIf { it.isNotBlank() }?.let { "原因 $it" },
+                    meta.optString("last_failure_code").takeIf { it.isNotBlank() },
+                ).joinToString(" / ")
+                mark("warning", "冷却中，剩余 ${risk.optLong("cooldown_remaining_sec")}s" +
+                    if (why.isNotBlank()) "（$why）" else "（原因未知：早期版本未记录）")
+            }
             val failures = risk.optInt("failure_count", 0)
             if (failures >= 3) mark("warning", "连续失败 $failures 次")
 
@@ -1149,10 +1171,10 @@ object NativeCore {
                         if (text.contains("cloudflare") || text.contains("attention required")) {
                             mark("warning", "Cloudflare 拦截：疑似出口 IP 被盯，先换节点再判断")
                         } else when (f.kind) {
-                            "policy" -> mark("warning", "上游策略拒绝（$f.code）：号可用，本次请求不合规")
-                            "blocked" -> mark("dead", "上游封锁账号（$f.code）")
-                            "auth" -> mark("dead", "凭据被拒（$f.code），需重新授权")
-                            "quota", "rate" -> mark("warning", "额度/限流（$f.code），等待恢复探测")
+                            "policy" -> mark("warning", "上游策略拒绝（${f.code}）：号可用，本次请求不合规")
+                            "blocked" -> mark("dead", "上游封锁账号（${f.code}）")
+                            "auth" -> mark("dead", "凭据被拒（${f.code}），需重新授权")
+                            "quota", "rate" -> mark("warning", "额度/限流（${f.code}），等待恢复探测")
                             else -> mark("warning", "探测失败：${f.code}（${(err.message ?: "").take(60)}）")
                         }
                     }
@@ -1302,6 +1324,24 @@ object NativeCore {
         return removed
     }
 
+    /**
+     * 清除冷却（把号立刻放回池子）。
+     *
+     * 用途有二：① 误冷却的补救（例如客户端错误被误判成账号故障）；
+     * ② 确认上游已恢复时手动提前放行。**只清冷却与风控标注，不动凭据**。
+     */
+    fun clearCooldowns(context: Context, keys: List<String>): Int {
+        var n = 0
+        val targets = if (keys.isEmpty()) store(context).accountKeys() else keys
+        targets.forEach { key ->
+            if (store(context).clearAccountCooldown(key)) {
+                store(context).setAccountRisk(key, "", "")
+                n++
+            }
+        }
+        return n
+    }
+
     /** 批量停用/启用账号，返回影响条数。 */
     fun setAccountsEnabled(context: Context, keys: List<String>, enabled: Boolean): Int {
         var n = 0
@@ -1329,6 +1369,16 @@ object NativeCore {
             .put("throttle_remaining_sec", remaining.toLong())
             .put("can_import_now", remaining <= 0.0 && pool < maxAccounts)
             .put("imported_total", settings.optString("farm_imported_total", "0").toIntOrNull() ?: 0)
+            // 可用 = 已启用且不在冷却期（与概览页号池健康、补号自检同口径）
+            .put("available", run {
+                var n = 0
+                val now = System.currentTimeMillis() / 1000.0
+                for (i in 0 until listAccounts(context).length()) {
+                    val a = listAccounts(context).getJSONObject(i)
+                    if (a.optBoolean("enabled", true) && a.optDouble("cooldown_until", 0.0) <= now) n++
+                }
+                n
+            })
             .put("reject_bot_flag", settings.optString("farm_reject_bot_flag", "1") == "1")
             .put("auto_disable_on_bot_flag", settings.optString("farm_disable_on_bot_flag", "1") == "1")
     }
@@ -1618,6 +1668,27 @@ object NativeCore {
      * 这是"选号 → 刷新 token → 组请求"的唯一入口：调用方（ApiHostService）
      * 只需拿到 [UpstreamCall] 直接 execute，不需要关心上游协议差异。
      */
+    /**
+     * 客户端错误守卫：请求的模型不在已知目录里时直接判客户端错误。
+     *
+     * 为什么必须前置拦：实测发现**请求一个不存在的模型名**时，上游对每个账号都返回
+     * `personal-team-blocked:spending-limit`，而网关把它当成账号额度耗尽 →
+     * 一次请求顺着重试链把 8 个号全打进 6h 冷却（可用率 94%→44%）。
+     * 模型名错是客户端问题，不该由账号买单，所以这里先校验、直接 400 返回。
+     */
+    fun rejectUnknownModel(context: Context, requested: String): String? {
+        if (requested.isBlank()) return null
+        val known = runCatching { modelsCached(context) }.getOrNull() ?: return null
+        if (known.length() == 0) return null          // 目录还没就绪：不拦，交给上游判
+        for (i in 0 until known.length()) {
+            val id = known.optJSONObject(i)?.optString("id").orEmpty()
+            if (id == requested) return null
+        }
+        // 常见别名/前缀（如 grok-4.6-low、-high、-medium、-xhigh）在目录里已展开；
+        // 仍不匹配则视为未知模型
+        return "未知模型 \"$requested\"：不在当前可用目录中（未消耗任何账号额度）"
+    }
+
     fun upstreamRequest(context: Context, body: JSONObject, requiredRegion: AccountRegion, cacheKey: String? = null): UpstreamCall {
         val account = accountForRequest(context, requiredRegion)
         val converted = XaiProtocol.chatToResponses(body)
@@ -1724,6 +1795,30 @@ object NativeCore {
         val message: String = ""
     ) {
         enum class Kind { NONE, FREE_QUOTA, MODEL_QUOTA, SPENDING_LIMIT, RATE_LIMIT, SERVER, AUTH, BLOCKED }
+
+        companion object {
+        /** 冷却原因（写库给面板看）。与 RiskLogic 的 kind 口径保持一致，便于统一分析。 */
+        fun reasonOf(kind: Kind): String = when (kind) {
+            Kind.FREE_QUOTA, Kind.MODEL_QUOTA, Kind.SPENDING_LIMIT -> "quota"
+            Kind.RATE_LIMIT -> "rate"
+            Kind.SERVER -> "server"
+            Kind.AUTH -> "auth"
+            Kind.BLOCKED -> "blocked"
+            Kind.NONE -> "unknown"
+        }
+
+        /** 失败机器码（面板上显示的"为什么不可用"）。 */
+        fun codeOf(kind: Kind): String = when (kind) {
+            Kind.FREE_QUOTA -> "free_usage_exhausted"
+            Kind.MODEL_QUOTA -> "model_quota_exhausted"
+            Kind.SPENDING_LIMIT -> "spending_limit"
+            Kind.RATE_LIMIT -> "upstream_rate_limited"
+            Kind.SERVER -> "upstream_server_error"
+            Kind.AUTH -> "upstream_unauthorized"
+            Kind.BLOCKED -> "account_blocked"
+            Kind.NONE -> "unknown"
+        }
+        }
     }
 
     /**
@@ -1965,7 +2060,18 @@ object NativeCore {
             val priorFailures = store(context).getAccount(accountKey)?.optInt("failure_count", 0) ?: 0
             val cooldown = if (exhaustion.kind == Exhaustion.Kind.BLOCKED) base
                 else (base shl priorFailures.coerceIn(0, 8)).coerceAtMost(7L * 24 * 3600)
-            store(context).markAccountFailure(accountKey, cooldown)
+            // 冷却原因与失败码一起写：否则面板只能显示"冷却中"，说不出为什么（真实踩到）。
+            val nextProbe = if (exhaustion.kind == Exhaustion.Kind.FREE_QUOTA ||
+                exhaustion.kind == Exhaustion.Kind.MODEL_QUOTA ||
+                exhaustion.kind == Exhaustion.Kind.SPENDING_LIMIT ||
+                exhaustion.kind == Exhaustion.Kind.RATE_LIMIT
+            ) System.currentTimeMillis() / 1000.0 + cooldown.coerceAtMost(1800L) else 0.0
+            store(context).markAccountFailure(
+                accountKey, cooldown,
+                reason = Exhaustion.reasonOf(exhaustion.kind),
+                failureCode = Exhaustion.codeOf(exhaustion.kind),
+                nextProbeAt = nextProbe,
+            )
         }
     }
 

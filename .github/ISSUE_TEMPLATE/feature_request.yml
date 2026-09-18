@@ -1,0 +1,43 @@
+name: 💡 功能建议
+description: 想要新能力，或对现有行为有改进想法
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: 相关模块
+      options:
+        - 协议网关（接口兼容性、新协议）
+        - 号池调度与风控
+        - 产号农场（注册链路、邮箱源、节奏）
+        - App 界面与体验
+        - 部署 / 构建 / 文档
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 先说场景和痛点，再说你想要的功能——这样更容易讨论出更合适的做法
+      placeholder: 我有 N 个号，每次……很麻烦，希望……
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你设想的做法（可选）
+      description: 有具体想法就写，没有也没关系
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你试过的替代方案（可选）
+      description: 比如用其它工具、手动操作、改设置项绕开
+    validations:
+      required: false

@@ -44,7 +44,18 @@ class OAuthWebActivity : Activity() {
 
         /** 登录页会做浏览器探测：默认 WebView UA 带 "; wv" 标记，容易被降级渲染或直接拒绝；
          *  伪装成同版本移动 Chrome，仍然由内置 WebView 承载，不会跳出应用。 */
-        private const val MOBILE_UA =
+        // 旧版写死 Chrome/125：随系统 WebView 内核升级（已 13x），"内核行为 vs UA 声明"
+        // 不一致会抬高 Cloudflare/Turnstile 的质询概率（UA 一致性是它们的指纹信号之一）。
+        // 改为用系统 WebView 真实 UA——授权页本来就跑在这台手机的内核上，声明真实版本最稳。
+        private fun mobileUserAgent(context: android.content.Context): String {
+            val real = runCatching {
+                android.webkit.WebSettings.getDefaultUserAgent(context)
+            }.getOrNull().orEmpty()
+            // 只在拿到"像移动端 UA"的真值时使用；拿不到（极端 ROM）就退回静态 UA
+            return if (real.contains("Mobile") && real.contains("Chrome/")) real else MOBILE_UA
+        }
+
+        private val MOBILE_UA =
             "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/125.0.0.0 Mobile Safari/537.36"
 
@@ -261,7 +272,7 @@ class OAuthWebActivity : Activity() {
             // WebView 把它们写进 app_webview 后不会自动回收（WebView 磁盘缓存无容量上限）。
             // 改为 LOAD_NO_CACHE：每次都回源，登录页本就不该被缓存复用（避免旧票据回流）。
             cacheMode = WebSettings.LOAD_NO_CACHE
-            userAgentString = MOBILE_UA
+            userAgentString = mobileUserAgent(this@OAuthWebActivity)
         }
         // 第三方登录（企微/微信等）依赖 cookie 与 localStorage，必须放开
         CookieManager.getInstance().setAcceptCookie(true)
@@ -296,7 +307,7 @@ class OAuthWebActivity : Activity() {
                 val popup = WebView(this@OAuthWebActivity)
                 popup.settings.javaScriptEnabled = true
                 popup.settings.domStorageEnabled = true
-                popup.settings.userAgentString = MOBILE_UA
+                popup.settings.userAgentString = mobileUserAgent(this@OAuthWebActivity)
                 popup.webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(
                         v: WebView,
@@ -345,24 +356,45 @@ class OAuthWebActivity : Activity() {
                 view.evaluateJavascript(PROBE_BODY_JS) { len ->
                     Log.i(TAG, "onPageFinished $url title=${view.title} bodyHtml=$len")
                     val blank = len?.removePrefix(""")?.removeSuffix(""")?.toDoubleOrNull() == 0.0
-                    if (blank && blankRetries < 1 && url.isNotBlank() && !url.startsWith("data:")) {
-                        // 白屏自愈：CDN 偶发返回空文档时自动重载一次。限一次防死循环；
-                        // 第二次仍白屏就显示错误条，交用户手动重试。
-                        blankRetries++
-                        Log.w(TAG, "blank page detected, auto-reloading (attempt $blankRetries)")
-                        statusText?.text = "页面异常，自动重载…"
-                        view.postDelayed({ if (!isFinishing && !isDestroyed) view.reload() }, 1200)
+                    // 白屏自愈只对"真的停在空白页"启用：xAI 授权链是服务端 302 链，
+                    // 中间过渡页天然短暂为空，body 探测常抢在 React 注入内容前执行。
+                    // 在 302 仍在推进时 reload 会作废刚拿到的表单令牌 → 提交即 Invalid action
+                    // （真机实测：旧版"都可以"、加了激进自愈后频繁 Invalid action）。
+                    // 判据：onPageFinished 后再等 1.5s，body 仍为 0 且 URL 没变才算真白屏。
+                    if (blank && url.isNotBlank() && !url.startsWith("data:")) {
+                        val capturedUrl = url
+                        view.postDelayed({
+                            if (isFinishing || isDestroyed) return@postDelayed
+                            // URL 已变 = 302 正常推进中，绝不是白屏，什么都不做
+                            if (view.url != capturedUrl) return@postDelayed
+                            view.evaluateJavascript(PROBE_BODY_JS) { len2 ->
+                                val stillBlank =
+                                    len2?.removePrefix(""")?.removeSuffix(""")?.toDoubleOrNull() == 0.0
+                                if (stillBlank && blankRetries < 1) {
+                                    blankRetries++
+                                    Log.w(TAG, "blank page confirmed, auto-reloading (attempt $blankRetries)")
+                                    statusText?.text = "页面异常，自动重载…"
+                                    view.reload()
+                                } else if (stillBlank) {
+                                    errorText.text = "页面加载异常（重载后仍为空）"
+                                    errorBar.visibility = View.VISIBLE
+                                }
+                            }
+                        }, 1500)
                         return@evaluateJavascript
-                    }
-                    if (blank && blankRetries >= 1) {
-                        errorText.text = "页面加载异常（重载后仍为空）"
-                        errorBar.visibility = View.VISIBLE
                     }
                 }
                 // 登录表单在 Keycloak iframe 内，稍等再抓一次可见文本；拿到关键字即说明表单可用
                 view.postDelayed({
                     if (isFinishing || isDestroyed) return@postDelayed
-                    view.evaluateJavascript(PROBE_TEXT_JS) { text -> Log.i(TAG, "pageText=$text") }
+                    view.evaluateJavascript(PROBE_TEXT_JS) { text ->
+                        Log.i(TAG, "pageText=$text")
+                        // Invalid action = 提交时表单令牌为空/过期（多为页面被 reload 或过早点击）。
+                        // 给出明确自救指引，而不是让用户对着报错发呆。
+                        if (text?.contains("Invalid action") == true || text?.contains("invalid action") == true) {
+                            statusText?.text = "表单令牌已失效：点「返回」再进一次，等按钮可点后手动点「允许」"
+                        }
+                    }
                 }, 3000)
                 statusText?.text = "授权页已加载 · 确认后自动完成并关闭"
             }

@@ -1,0 +1,94 @@
+name: 🐞 Bug 报告
+description: 网关 / 号池 / 产号出了问题，附上诊断报告帮你定位
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### 先做两件事
+        1. **升级到最新 Release 再复现一次** —— 旧版本的老问题不用报。
+        2. **导出诊断报告**：App「产号」页点 **「诊断」** → 存到 Download。这份报告在落盘前已过脱敏（邮箱本地部分、验证码、cookie / token / JWT 都已隐去），可以直接贴出来。
+        3. 提交前请**扫一眼粘贴的内容**，确认没有你自己的私密信息（比如你的 API Key、真实邮箱）。
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 问题出在哪一块
+      options:
+        - 协议网关（/v1 接口调用、流式、工具调用）
+        - 号池调度（轮询、换号、冷却、额度统计）
+        - 产号农场（注册、收码、Turnstile、mint、补登）
+        - 号池体检 / 风控判定
+        - App 界面 / 保活 / 安装
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: app_version
+    attributes:
+      label: App 版本
+      description: App 首页或「更多」页可见，例如 1.8.1-farm
+      placeholder: 1.8.1-farm
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: 手机型号 / Android 版本 / ROM
+      description: 设置 → 关于手机。ROM 有用是因为部分定制系统会拦局域网入站
+      placeholder: 例如 某品牌 X / Android 16 / 定制 ROM
+    validations:
+      required: true
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: 现象与复现步骤
+      description: 做了什么 → 期望什么 → 实际什么。能稳定复现的话写清步骤，偶发的说明频率
+      placeholder: |
+        1. 「产号」页选 mail.tm，点开批
+        2. 第 2 个号卡在 fillCodeAndSubmit
+        3. 期望自动重试收码；实际等到超时后整批停下
+    validations:
+      required: true
+
+  - type: textarea
+    id: diag_report
+    attributes:
+      label: 诊断报告内容
+      description: 把导出的 grok2api-diag-*.txt 内容粘贴到这里（或把文件拖进下面的附件框）
+      render: text
+      placeholder: 粘贴诊断报告全文……
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra_log
+    attributes:
+      label: 额外日志（可选）
+      description: |
+        需要更原始的信息时，App 里点出问题的那次操作后，用 adb 取本机原始日志（**含凭据，请自行确认后再发**）：
+        `adb exec-out run-as com.grok2api.gateway cat files/farm.log`
+        能贴的是**已过脱敏的诊断报告**优先；这段只在你确认无敏感信息时再附。
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: 你已经试过什么（可选）
+      description: 例如换邮箱源、清冷却、换浏览器登录、重启 App —— 能省掉一轮来回
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已在最新 Release 上复现，且粘贴内容里没有我自己的凭据（API Key / 真实邮箱 / 密码）
+          required: true

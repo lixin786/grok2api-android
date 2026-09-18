@@ -60,6 +60,10 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         ensureColumn(db, "apps", "key_enc", "TEXT NOT NULL DEFAULT ''")
         ensureColumn(db, "apps", "region", "TEXT NOT NULL DEFAULT 'domestic'")
         ensureColumn(db, "apps", "updated_at", "REAL NOT NULL DEFAULT 0")
+        // v13：farm_ledger 凭据列。历史行留空（那时号已经丢了，补不回来）——
+        // 查询侧以 `sso_enc<>''` 作为「可补登」的判据，空值行自动被排除。
+        ensureColumn(db, "farm_ledger", "sso_enc", "TEXT NOT NULL DEFAULT ''")
+        ensureColumn(db, "farm_ledger", "password_enc", "TEXT NOT NULL DEFAULT ''")
         db.execSQL("UPDATE apps SET updated_at=created_at WHERE updated_at=0")
         ensureColumn(db, "usage_logs", "input_content", "TEXT NOT NULL DEFAULT ''")
         ensureColumn(db, "usage_logs", "output_content", "TEXT NOT NULL DEFAULT ''")
@@ -102,6 +106,9 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
             last_used_at REAL NOT NULL DEFAULT 0,
             last_checkin_date TEXT, failure_count INTEGER NOT NULL DEFAULT 0,
             cooldown_until REAL NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+            risk_level TEXT NOT NULL DEFAULT '', risk_reason TEXT NOT NULL DEFAULT '',
+            last_failure_code TEXT NOT NULL DEFAULT '', cooldown_reason TEXT NOT NULL DEFAULT '',
+            next_probe_at REAL NOT NULL DEFAULT 0,
             UNIQUE(region, uid)
         )""")
     }
@@ -131,6 +138,19 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
             model_id TEXT PRIMARY KEY, ok INTEGER NOT NULL DEFAULT 0,
             latency_ms INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
             checked_at REAL NOT NULL DEFAULT 0
+        )""")
+        // v12：产号（App 内自动注册）台账。一条记录 = 一次注册尝试。
+        // status 枚举与 PC 端 farm 管道对齐：pooled / register_failed / code_failed /
+        // turnstile_failed / mint_failed / import_failed / flagged_skip / stopped
+        // v13 新增 registered（注册已成功、尚未入池）与 backfill_failed（补登失败待重试）两态，
+        // 并把 sso / password 落盘（sso_enc / password_enc，AES-GCM）——注册成功但 mint 失败时
+        // 没有凭据就再也回不到这个号，只能重新注册且邮箱已经用掉。
+        db.execSQL("""CREATE TABLE IF NOT EXISTS farm_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+            email TEXT NOT NULL DEFAULT '', lane INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+            uid TEXT NOT NULL DEFAULT '',
+            sso_enc TEXT NOT NULL DEFAULT '', password_enc TEXT NOT NULL DEFAULT ''
         )""")
         db.execSQL("""CREATE TABLE IF NOT EXISTS model_cache (
             cache_key TEXT PRIMARY KEY, payload TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'dynamic',
@@ -292,11 +312,19 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         put("failure_count", 0); put("cooldown_until", 0); put("last_used_at", nowSeconds()); put("updated_at", nowSeconds())
     })
 
-    fun markAccountFailure(accountKey: String, cooldownSeconds: Long): Boolean = synchronized(lock) {
+    /**
+     * 记录一次账号失败并设置冷却。
+     *
+     * `reason` / `failureCode` 必须一起写：面板要能回答"这个号为什么不可用"。
+     * 早期只写 cooldown_until，导致健康检查只能说"冷却中"说不出原因（真实踩到）。
+     */
+    fun markAccountFailure(accountKey: String, cooldownSeconds: Long,
+                           reason: String = "", failureCode: String = "",
+                           nextProbeAt: Double = 0.0): Boolean = synchronized(lock) {
         val current = getAccount(accountKey) ?: return@synchronized false
         updateAccount(accountKey, ContentValues().apply {
             put("failure_count", current.optInt("failure_count") + 1)
-            put("cooldown_until", nowSeconds() + max(0L, cooldownSeconds)); put("updated_at", nowSeconds())
+            put("cooldown_reason", reason); put("last_failure_code", failureCode); put("next_probe_at", nextProbeAt); put("cooldown_until", nowSeconds() + max(0L, cooldownSeconds)); put("updated_at", nowSeconds())
         })
     }
 
@@ -714,6 +742,114 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         getSettings()
     }
 
+    // ------------------------------------------------------------- 产号台账（farm_ledger）
+
+    /**
+     * 写一条台账，返回 rowId。
+     *
+     * 返回 rowId 是为了让调用方在同一个注册尝试上「先记 registered、再改成 pooled / mint_failed」，
+     * 而不是成功失败各插一行——否则补登时无法区分「这条是待补」还是「这条是上次失败留下的墓碑」。
+     *
+     * [sso] / [password] 为注册凭据，加密后落盘；空串表示该尝试没走到拿凭据那一步（如收码就失败）。
+     */
+    fun appendFarmLedger(email: String, lane: Int, status: String, error: String = "", uid: String = "",
+                         sso: String = "", password: String = ""): Long = synchronized(lock) {
+        writableDatabase.insert("farm_ledger", null, ContentValues().apply {
+            put("ts", nowSeconds()); put("email", email); put("lane", lane)
+            put("status", status); put("error", error.take(300)); put("uid", uid)
+            put("sso_enc", if (sso.isBlank()) "" else encrypt(sso))
+            put("password_enc", if (password.isBlank()) "" else encrypt(password))
+        })
+    }
+
+    /** 就地改一条台账的状态（凭据列保持不动，补登才能反复重试）。 */
+    fun updateFarmLedger(id: Long, status: String, uid: String = "", error: String = "") = synchronized(lock) {
+        writableDatabase.update("farm_ledger", ContentValues().apply {
+            put("status", status); put("uid", uid); put("error", error.take(300))
+        }, "id=?", arrayOf(id.toString()))
+        Unit
+    }
+
+    /** 一次可补登的号：注册已成功（拿到 sso）但尚未入池。 */
+    class PendingFarm(val id: Long, val email: String, val sso: String, val password: String)
+
+    /**
+     * 待补登清单（新→旧）。
+     *
+     * 判据是「有 sso 且状态仍是注册态」：mint_failed / backfill_failed 会被反复取出来重试，
+     * 直到成功（改成 pooled）或凭据解不开（decrypt 失败返回空，调用方跳过）。
+     */
+    fun listFarmPending(limit: Int = 20): List<PendingFarm> = synchronized(lock) {
+        val out = mutableListOf<PendingFarm>()
+        readableDatabase.rawQuery(
+            "SELECT id,email,sso_enc,password_enc FROM farm_ledger " +
+                "WHERE sso_enc<>'' AND status IN (${FARM_PENDING_IN}) " +
+                "ORDER BY id DESC LIMIT ?",
+            arrayOf(limit.coerceIn(1, 200).toString())
+        ).use { c ->
+            while (c.moveToNext()) {
+                out += PendingFarm(c.getLong(0), c.getString(1) ?: "", decrypt(c.getString(2) ?: ""), decrypt(c.getString(3) ?: ""))
+            }
+        }
+        out
+    }
+
+    /** 待补登条数（UI 徽标 + 批次结束是否自动补一场的判据）。 */
+    fun farmPendingCount(): Int = synchronized(lock) {
+        readableDatabase.rawQuery(
+            "SELECT COUNT(*) FROM farm_ledger WHERE sso_enc<>'' AND status IN (${FARM_PENDING_IN})",
+            null
+        ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+    }
+
+    /**
+     * 按 rowId 取待补登的号（批次收尾自动补登用：只补本批失败的那几个）。
+     *
+     * 之所以要这条路径：每批结束都全量补登的话，一个反复失败的号会在每批末尾
+     * 白耗一次 150s 授权超时——自动补只该覆盖"刚失败的"，历史遗留交给用户手动点。
+     *
+     * id 是 Long，无拼接注入面；同时仍要求满足待补状态，避免误取已入池的行。
+     */
+    fun listFarmPendingByIds(ids: List<Long>): List<PendingFarm> {
+        if (ids.isEmpty()) return emptyList()
+        val inIds = ids.joinToString(",") { it.toString() }
+        return synchronized(lock) {
+            val out = mutableListOf<PendingFarm>()
+            readableDatabase.rawQuery(
+                "SELECT id,email,sso_enc,password_enc FROM farm_ledger " +
+                    "WHERE id IN ($inIds) AND sso_enc<>'' AND status IN (${FARM_PENDING_IN}) ORDER BY id DESC",
+                null
+            ).use { c ->
+                while (c.moveToNext()) {
+                    out += PendingFarm(c.getLong(0), c.getString(1) ?: "", decrypt(c.getString(2) ?: ""), decrypt(c.getString(3) ?: ""))
+                }
+            }
+            out
+        }
+    }
+
+    fun listFarmLedger(limit: Int = 50): JSONArray = synchronized(lock) {
+        val out = JSONArray()
+        readableDatabase.rawQuery(
+            "SELECT ts,email,lane,status,error,uid FROM farm_ledger ORDER BY id DESC LIMIT ?",
+            arrayOf(limit.coerceIn(1, 200).toString())
+        ).use { c ->
+            while (c.moveToNext()) out.put(JSONObject()
+                .put("ts", c.getDouble(0)).put("email", c.getString(1)).put("lane", c.getInt(2))
+                .put("status", c.getString(3)).put("error", c.getString(4)).put("uid", c.getString(5)))
+        }
+        out
+    }
+
+    /** 台账状态计数（成功率面板用）：status -> count。 */
+    fun farmLedgerStats(): JSONObject = synchronized(lock) {
+        val out = JSONObject()
+        readableDatabase.rawQuery("SELECT status, COUNT(*) FROM farm_ledger GROUP BY status", null).use { c ->
+            while (c.moveToNext()) out.put(c.getString(1).ifBlank { "unknown" }, c.getInt(1))
+        }
+        out
+    }
+
     fun saveModelCache(models: JSONArray, source: String = "dynamic", ttlSeconds: Long = 3600, region: String = "domestic"): Unit = synchronized(lock) {
         val now = nowSeconds()
         writableDatabase.insertWithOnConflict("model_cache", null, ContentValues().apply {
@@ -857,8 +993,21 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         // v11：新增号池风控状态列（risk_level/risk_reason/last_failure_code/
         // cooldown_reason/next_probe_at）——面板徽章、异常置顶与恢复探测都依赖它们。
         // 注意：新增 ensureColumn 必须同时升这个版本号，否则老库不会执行迁移（踩过）。
-        private const val DATABASE_VERSION = 11
+        // v12：新增 farm_ledger 表（产号台账）——同一条铁律的第三次执行。
+        // v13：farm_ledger 新增 sso_enc / password_enc（注册凭据，AES-GCM 加密）——第四次。
+        private const val DATABASE_VERSION = 13
         private const val KEY_ALIAS = "grok_native_app_keys"
+
+        /**
+         * 「注册已成功、凭据已留档、但还没进号池」的台账状态集合。
+         *
+         * 补登查询要读它、面板徽标也要读它 —— 收到一处定义是为了避免两边各写一份字面量，
+         * 将来加状态时只改这里，不会出现「SQL 认为是待补、UI 却算成失败」的错位。
+         */
+        val FARM_PENDING_STATUSES = listOf("registered", "mint_failed", "backfill_failed")
+
+        /** 供 SQL IN 子句用（值全为内部常量，无拼接注入面）。 */
+        private val FARM_PENDING_IN: String = FARM_PENDING_STATUSES.joinToString(",") { "'$it'" }
         /** 优先级下限：0 = 不额外加权（选号权重 = 1.0）。 */
         const val MIN_PRIORITY = 0
         /** 优先级上限：兜底防止误写极端值，让加权随机退化成固定选号。 */
@@ -883,7 +1032,23 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
             "cooldown_risk_sec" to "1800", "quality_probe_enabled" to "0",
             "quality_probe_model" to "grok-4.6",
             "farm_reject_bot_flag" to "1", "farm_disable_on_bot_flag" to "1",
-            "farm_last_import_ts" to "0", "farm_imported_total" to "0")
+            "farm_last_import_ts" to "0", "farm_imported_total" to "0",
+            // 产号邮箱源（照抄 taixu 四源 + mail.tm 免配置默认）
+            //  farm_provider          mailtm(默认免配置) / duckmail / yyds / cloudflare / cloudmail
+            //  duckmail_api_key       api.duckmail.sbs 可选 Bearer
+            //  yyds_jwt / yyds_api_key  maliapi.215.im 二选一
+            //  cloudflare_api_base/_key/_domains/_path_accounts  自建 Cloudflare 邮箱
+            //  cloudmail_api_base/_public_token/_domains/_path_messages  自建 Cloud Mail
+            "farm_provider" to "mailtm",
+            "duckmail_api_key" to "",
+            "yyds_jwt" to "", "yyds_api_key" to "",
+            "cloudflare_api_base" to "", "cloudflare_api_key" to "",
+            "cloudflare_domains" to "", "cloudflare_path_accounts" to "/admin/new_address",
+            "cloudmail_api_base" to "", "cloudmail_public_token" to "",
+            "cloudmail_domains" to "", "cloudmail_path_messages" to "/api/mail/list",
+            // 定时补号：farm_auto_threshold 可用率阈值%，farm_auto_batch=1 时允许自动开批
+            "farm_auto_threshold" to "70", "farm_auto_batch" to "0",
+            "farm_last_autotopup" to "", "farm_last_autotopup_detail" to "")
         /**
          * 记录内容字段的入库上限。取值理由：
          * - 输入 4000 字符 ≈ 一整轮较长对话；截断只影响超长多轮历史，日常排查完全够用。

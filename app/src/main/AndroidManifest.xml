@@ -22,6 +22,7 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
+        android:name=".GrokApp"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
@@ -45,6 +46,14 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".FarmSettingsActivity"
+            android:exported="false" />
+        <activity
+            android:name=".FarmActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize" />
         <service
             android:name=".ApiHostService"
             android:exported="false"
@@ -54,6 +63,11 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="User-started native on-device API server" />
         </service>
+        <!-- 产号定时补号自检（每小时 AlarmManager 唤醒，检查池可用率） -->
+        <receiver
+            android:name=".FarmTopUpReceiver"
+            android:enabled="true"
+            android:exported="false" />
         <!-- 开机自启接收器：用户在 App 里开着服务时，系统重启后自动恢复。 -->
         <receiver
             android:name=".BootReceiver"

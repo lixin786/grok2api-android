@@ -22,6 +22,15 @@ local.properties
 *.db
 *.db-wal
 *.db-shm
+# SQLite 预写日志/回滚日志：可能含未落盘的账号数据
+*.wal
+*.journal
+*.sqlite
+*.sqlite3
+# 产号台账导出与日志
+farm.log
+*.log
+diag/
 # 账号 auth 文件
 auths/
 data/
@@ -50,6 +59,11 @@ frontend/dist/
 # ── 工具临时目录 ────────────────────────────────────
 .taixu-tmp/
 .taixu-subagent/
+# uiautomator dump / 调试脚本 / 真机截图：排查用的过程产物，含界面与账号信息
+ui_*.xml
+*.uix
+step*.js
+scratch/
 
 # ── 系统 ───────────────────────────────────────────
 .DS_Store

@@ -17,11 +17,13 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.grok2api.gateway"
+        // 产号版（独立 App，与正式版并存互不覆盖）。版本号必须与 Release 归档名同步——
+        // 之前只重命名了 dist 文件、忘了 bump 元数据，导致系统安装界面仍显示 1.6。
+        applicationId = "com.grok2api.gateway.farm"
         minSdk = 24
         targetSdk = 36
-        versionCode = 17
-        versionName = "1.5.3-test"
+        versionCode = 25
+        versionName = "1.8.1-farm"
     }
 
     signingConfigs {

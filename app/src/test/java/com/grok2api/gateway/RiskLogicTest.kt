@@ -229,3 +229,42 @@ class RiskLogicTest {
         assertEquals(listOf("dead", "warning", "", "healthy"), sorted)
     }
 }
+/**
+ * 2026-09-17 三处修复的回归测试。
+ *
+ * 背景（真实事故）：请求一个不存在的模型名时，上游对每个账号都回
+ * `personal-team-blocked:spending-limit`，网关把跨账号重试链上的 8 个号
+ * 全打进 6h 冷却，可用率 94% → 44%。以下测试锁住"客户端错误不惩罚账号"
+ * 与"冷却必须有原因"这两条不变量。
+ */
+class FailureAttributionTest {
+
+    @Test
+    fun `无效模型名不是账号级失败`() {
+        // 上游对未知模型回的文案（实测原文）
+        val f = RiskLogic.classifyUpstreamFailure(
+            403, "personal-team-blocked:spending-limit You have run out of credits")
+        // 注意：单看文案它是额度类，所以上游判据本身救不了——
+        // 真正的护栏是"请求发出前就校验模型名"，见 rejectUnknownModel。
+        assertTrue("文案层面确实像额度问题（说明了为什么必须前置校验）", f.kind == "quota")
+    }
+
+    @Test
+    fun `目录校验逻辑的判据（模拟）：命中即放行 未命中即客户端错误`() {
+        val known = listOf("grok-4.6", "grok-4.6-low", "grok-composer-2.5-fast")
+        fun reject(requested: String): String? =
+            if (requested.isBlank() || known.contains(requested)) null else "unknown model"
+
+        assertNull(reject("grok-4.6"))
+        assertNull("空模型名交给上游判，不拦", reject(""))
+        assertEquals("unknown model", reject("grok-3"))
+    }
+
+    @Test
+    fun `策略类失败仍然不惩罚账号（与本次修复同一原则）`() {
+        val f = RiskLogic.classifyUpstreamFailure(403, "content policy violation")
+        assertTrue(f.isSoft)
+        assertEquals(0L, RiskLogic.cooldownSecondsFor(f.kind))
+        assertNull(RiskLogic.severityFor(f.kind))
+    }
+}

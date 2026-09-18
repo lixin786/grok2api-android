@@ -320,6 +320,18 @@ class ApiHostService : Service() {
                     Log.i(TAG, "POST /admin/risk/scan -> total=${report.optInt("total")} flagged=${report.optInt("flagged")}")
                     json(output, 200, report)
                 }
+                method == "POST" && path == "/admin/accounts/cooldown/clear" -> {
+                    // 清冷却：把被误判/已恢复的号立刻放回池子（keys 省略则全池）
+                    val payload = runCatching { parseBody(bodyText) }.getOrNull()
+                    val keys = mutableListOf<String>()
+                    payload?.optJSONArray("keys")?.let { arr ->
+                        for (i in 0 until arr.length()) keys.add(arr.optString(i))
+                    }
+                    val n = NativeCore.clearCooldowns(this, keys)
+                    Log.i(TAG, "POST /admin/accounts/cooldown/clear -> cleared=$n")
+                    json(output, 200, JSONObject().put("ok", true).put("cleared", n)
+                        .put("pool_count", NativeCore.listAccounts(this).length()))
+                }
                 method == "GET" && path == "/admin/farm/status" -> {
                     json(output, 200, NativeCore.farmStatus(this))
                 }
@@ -398,15 +410,23 @@ class ApiHostService : Service() {
                     val payload = parseBody(bodyText)
                     if ((payload.optJSONArray("messages")?.length() ?: 0) == 0)
                         throw ClientError("messages is required")
+                    // 未知模型属客户端错误：直接 400，绝不进入跨账号重试链
+                    // （否则上游的 spending-limit 文案会把一串好号误冷却）
+                    NativeCore.rejectUnknownModel(this, payload.optString("model"))?.let {
+                        logRejected(method, path, startedAt, it, selectedApp)
+                        throw ClientError(it)
+                    }
                     proxy(output, socket, payload, Protocol.CHAT, payload.optBoolean("stream", false), selectedApp)
                 }
                 method == "POST" && path == "/v1/messages" -> {
                     val payload = parseBody(bodyText)
+                    NativeCore.rejectUnknownModel(this, payload.optString("model"))?.let { throw ClientError(it) }
                     proxy(output, socket, ProtocolAdapters.anthropicToChat(payload), Protocol.ANTHROPIC,
                         if (payload.has("stream")) payload.optBoolean("stream") else true, selectedApp)
                 }
                 method == "POST" && path == "/v1/responses" -> {
                     val payload = parseBody(bodyText)
+                    NativeCore.rejectUnknownModel(this, payload.optString("model"))?.let { throw ClientError(it) }
                     proxy(output, socket, ProtocolAdapters.responsesToChat(payload), Protocol.RESPONSES,
                         if (payload.has("stream")) payload.optBoolean("stream") else true, selectedApp)
                 }
